@@ -532,6 +532,76 @@ async function checkIsPaywall(page) {
   });
 }
 
+// Автоответчик на уточняющие вопросы v0 ("Какой тип боя?" / "1 of 3" и т.д.),
+// которые вылезают ПЕРЕД стартом генерации и блокируют всё.
+// Стратегия: на каждом шаге жмём первый вариант (radio), затем Next.
+// Если Next не активен или нет вариантов — жмём Skip. Повторяем, пока модалка
+// не исчезнет или не упрёмся в лимит шагов.
+async function dismissClarifyingQuestions() {
+  const MAX_ROUNDS = 8;
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    // Ищем модалку-опросник: radio/checkbox + Next или Skip + "N of M"/"Step N"
+    const dlg = page.locator('[role="dialog"]').last();
+    const visible = await dlg.isVisible({ timeout: 1500 }).catch(() => false);
+    if (!visible) return; // модалки нет — вопросов не было или все пройдены
+
+    const dlgText = (await dlg.innerText().catch(() => '')).toLowerCase();
+    const isQuestionnaire = dlgText.includes('of 3') ||
+                             dlgText.includes('of 2') ||
+                             dlgText.includes('of 4') ||
+                             dlgText.includes('step ') ||
+                             await dlg.locator('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]').count() > 0;
+    if (!isQuestionnaire) {
+      // Это другой диалог (Share, paywall и т.п.) — не трогаем, выходим
+      return;
+    }
+
+    console.log(`💬 Обнаружен уточняющий вопрос v0 (раунд ${round + 1}) — отвечаю первым вариантом...`);
+
+    // Жмём первый вариант (radio/checkbox или clickable row)
+    const firstOption = dlg.locator('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]').first();
+    if (await firstOption.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await firstOption.click({ force: true }).catch(() => {});
+    } else {
+      // Возможно, варианты — кликабельные строки без input
+      const row = dlg.locator('label, [role="option"], button').first();
+      if (await row.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await row.click({ force: true }).catch(() => {});
+      }
+    }
+    await page.waitForTimeout(400);
+
+    // Жмём Next (если он стал активным после выбора). Иначе — Skip.
+    const nextBtn = dlg.locator('button:has-text("Next"), button:has-text("Далее"), button:has-text("Continue")').first();
+    let clickedNext = false;
+    if (await nextBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+      const disabled = await nextBtn.getAttribute('disabled');
+      const ariaDisabled = await nextBtn.getAttribute('aria-disabled');
+      if (disabled === null && ariaDisabled !== 'true') {
+        await nextBtn.click({ force: true }).catch(() => {});
+        clickedNext = true;
+      }
+    }
+    if (!clickedNext) {
+      const skipBtn = dlg.locator('button:has-text("Skip"), button:has-text("Пропустить")').first();
+      if (await skipBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await skipBtn.click({ force: true }).catch(() => {});
+        console.log('   ↳ Next недоступен — нажали Skip.');
+      } else {
+        // Ни Next, ни Skip не нашлись — закрываем крестиком, чтобы не зависнуть
+        const closeBtn = dlg.locator('button[aria-label*="close" i], button[aria-label*="Close"], [aria-label*="close" i]').first();
+        if (await closeBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+          await closeBtn.click({ force: true }).catch(() => {});
+          console.log('   ↳ Ни Next, ни Skip — закрыли модалку.');
+        }
+        return;
+      }
+    }
+    await page.waitForTimeout(700);
+  }
+  console.log('⚠️ Достигнут лимит раундов автоответчика (8) — выходим, возможно остались вопросы.');
+}
+
 // Поиск и клик по меню выбора моделей
 async function openModelMenu() {
   const input = page.locator('textarea, [contenteditable="true"]').first();
@@ -734,8 +804,12 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
     await page.fill(inputSelector, prompt);
     await page.keyboard.press('Enter');
 
-    // Даем UI 2 секунды на реакцию (вдруг вылезет модалка Out of Credit)
+    // Даем UI 2 секунды на реакцию (модалка уточняющих вопросов / Out of Credit)
     await page.waitForTimeout(2000);
+
+    // 1b. АВТООТВЕТЧИК на уточняющие вопросы v0 ("Какой тип боя? 1 of 3" и т.д.),
+    //     которые блокируют старт генерации. Жмём первый вариант → Next, пока не закроются.
+    await dismissClarifyingQuestions();
 
     // 2. МГНОВЕННАЯ ПРОВЕРКА НА ЛИМИТ КРЕДИТОВ
     let isPaywall = await checkIsPaywall(page);
@@ -747,50 +821,68 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
       continue;
     }
 
-    // 3. ЖДЕМ СТАРТА
+    // 3. ЖДЕМ СТАРТА — с повторным прогоном автоответчика, если генерация
+    //    не стартовала (модалка уточняющих вопросов могла вылезти с задержкой)
     console.log('⏳ Ждем запуск генерации на сервере v0...');
     let started = false;
-    try {
-      await page.waitForFunction(() => {
+    const startDeadline = Date.now() + 30000;
+    while (Date.now() < startDeadline) {
+      const detected = await page.evaluate(() => {
         const text = document.body.innerText;
         const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="Cancel"]');
-
         const isWorking = text.includes("Generating") ||
                           text.includes("Thinking") ||
                           text.includes("Installing") ||
                           text.includes("Executing") ||
                           text.includes("Building");
-
         return !!stopBtn || isWorking;
-      }, { timeout: 15000 });
+      }).catch(() => false);
 
-      started = true;
-      console.log('⚡ Генерация официально пошла!');
-    } catch (e) {
-      console.log('⚠️ Статус генерации не засечен за 15 сек, но продолжаем контроль...');
+      if (detected) { started = true; break; }
+
+      // Не пошла — возможно, снова висит модалка вопросов. Прогоняем и ждём дальше.
+      await dismissClarifyingQuestions();
+      await page.waitForTimeout(2500);
     }
 
-    // 4. ЖДЕМ ФИНИША (с динамическим отслеживанием пейволла)
+    if (started) {
+      console.log('⚡ Генерация официально пошла!');
+    } else {
+      console.log('⚠️ Статус генерации не засечен за 30 сек, но продолжаем контроль...');
+    }
+
+    // 4. ЖДЕМ ФИНИША (с динамическим отслеживанием пейволла И модалок вопросов)
     if (started) {
       console.log('⏳ Ждем полного завершения всех шагов v0...');
-      try {
-        await page.waitForFunction(() => {
+      let finished = false;
+      const finishDeadline = Date.now() + 240000;
+      while (Date.now() < finishDeadline) {
+        // На каждом тике прогоняем автоответчик — v0 может подкинуть вопрос
+        // прямо посреди генерации, и она встанет, пока не ответим.
+        await dismissClarifyingQuestions();
+
+        const state = await page.evaluate(() => {
           const text = document.body.innerText;
           const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="Cancel"]');
-
           const isPaywallPresent = text.includes("Out of Credit") ||
                                    text.includes("out of credits") ||
                                    text.includes("Upgrade Plan") ||
                                    text.includes("Activate v0 Plus");
-
           const isStillWorking = text.includes("Generating") ||
                                  text.includes("Thinking") ||
                                  text.includes("Installing") ||
                                  text.includes("Executing") ||
                                  text.includes("Building");
+          return { done: isPaywallPresent || (!stopBtn && !isStillWorking), paywall: isPaywallPresent };
+        }).catch(() => ({ done: false, paywall: false }));
 
-          return isPaywallPresent || (!stopBtn && !isStillWorking);
-        }, { timeout: 240000 });
+        if (state.done) { finished = true; break; }
+        await page.waitForTimeout(2500);
+      }
+
+      if (!finished) {
+        throw new Error("Таймаут: генерация заняла больше 4 минут.");
+      }
 
         const hitPaywallDuringGen = await checkIsPaywall(page);
 
@@ -804,9 +896,6 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
         console.log('✨ Код сгенерирован! Ждем 4 сек на финализацию файлового дерева...');
         await page.waitForTimeout(4000);
         console.log('🎯 Генерация 100% окончена!');
-      } catch (e) {
-        throw new Error("Таймаут: генерация заняла больше 4 минут.");
-      }
     } else {
       console.log('⏳ Ожидаем 25 секунд на случай быстрой генерации...');
       await page.waitForTimeout(25000);
