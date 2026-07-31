@@ -37,6 +37,52 @@ let browser;
 let context;
 let page;
 
+// --- Fallback-хранилище состояния чата из БД-запросов (Supabase и др.) ---
+// Если share-link перенос по какой-то причине не сработает, здесь остаётся
+// последнее перехваченное состояние чата (сообщения, файлы, версии).
+const dbSniffLog = []; // кольцевой лог последних БД-ответов
+const DB_SNIFF_LIMIT = 50;
+let lastChatState = null; // { chatId, capturedAt, payload }
+
+function attachDbSniffer(targetPage) {
+  targetPage.on('response', async (response) => {
+    try {
+      const url = response.url();
+      const looksLikeDb =
+        url.includes('supabase') ||
+        url.includes('/rest/v1/') ||
+        url.includes('/api/chats') ||
+        url.includes('/api/chat/') ||
+        url.includes('postgres');
+
+      if (!looksLikeDb || !response.ok()) return;
+
+      const ct = response.headers()['content-type'] || '';
+      if (!ct.includes('json')) return;
+
+      const json = await response.json().catch(() => null);
+      if (!json) return;
+
+      const entry = { at: new Date().toISOString(), url, json };
+      dbSniffLog.push(entry);
+      if (dbSniffLog.length > DB_SNIFF_LIMIT) dbSniffLog.shift();
+
+      // Эвристика: ответы, похожие на состояние чата с файлами/версиями
+      const s = JSON.stringify(json);
+      if (s.includes('"files"') || s.includes('"versions"') || s.includes('"messages"')) {
+        const chatIdMatch = url.match(/chat[s]?\/([a-zA-Z0-9-]+)/);
+        lastChatState = {
+          chatId: chatIdMatch ? chatIdMatch[1] : null,
+          capturedAt: entry.at,
+          payload: json
+        };
+      }
+    } catch (_) {
+      // сниффер не должен ронять основной поток
+    }
+  });
+}
+
 async function setSessionCookie(token) {
   await context.clearCookies();
   await context.addCookies([{
@@ -52,7 +98,9 @@ async function setSessionCookie(token) {
 async function ensurePageAlive() {
   if (!browser || !browser.isConnected()) {
     browser = await chromium.launch({ headless: false });
-    context = await browser.newContext();
+    context = await browser.newContext({
+      permissions: ['clipboard-read', 'clipboard-write']
+    });
     page = null;
   }
   if (!page || page.isClosed()) {
@@ -60,8 +108,129 @@ async function ensurePageAlive() {
       await setSessionCookie(tokensPool[currentTokenIndex]);
     }
     page = await context.newPage();
+    attachDbSniffer(page);
     await page.goto('https://v0.app');
   }
+}
+
+// --- Перенос сессии через share-ссылку ---
+
+// На текущем аккаунте: открыть Share → выставить "Anyone on the web" → вернуть ссылку
+async function enableSharingAndGetLink() {
+  // 1. Открываем меню "..." в шапке чата и жмем Share, либо прямую кнопку Share
+  const directShare = page.locator('button:has-text("Share")').first();
+  if (await directShare.isVisible().catch(() => false)) {
+    await directShare.click();
+  } else {
+    const moreBtn = page.locator('button[aria-label="More"], button:has-text("...")').first();
+    if (await moreBtn.isVisible().catch(() => false)) {
+      await moreBtn.click();
+      await page.waitForTimeout(400);
+    }
+    await page.locator('[role="menuitem"]:has-text("Share"), button:has-text("Share")').first().click();
+  }
+  await page.waitForTimeout(1200);
+
+  // 2. В диалоге Share: дропдаун Visibility → "Anyone on the web"
+  const visibilityDropdown = page.locator(
+    '[role="dialog"] button:has-text("Only people with access"), [role="dialog"] [role="combobox"]:has-text("Only people")'
+  ).first();
+
+  if (await visibilityDropdown.isVisible().catch(() => false)) {
+    await visibilityDropdown.click();
+    await page.waitForTimeout(600);
+    await page.locator(
+      '[role="option"]:has-text("Anyone on the web"), [role="menuitem"]:has-text("Anyone on the web"), li:has-text("Anyone on the web")'
+    ).first().click();
+    await page.waitForTimeout(1000); // ждем применения настроек на сервере
+  }
+
+  // 3. Кликаем Copy Link и читаем ссылку
+  await page.locator('[role="dialog"] button:has-text("Copy Link"), button:has-text("Copy Link")').first().click();
+  await page.waitForTimeout(500);
+
+  let shareUrl = '';
+  try {
+    shareUrl = await page.evaluate(() => navigator.clipboard.readText());
+  } catch (_) {}
+
+  // Fallback: иногда ссылка лежит в readonly input внутри диалога
+  if (!shareUrl || !shareUrl.startsWith('http')) {
+    shareUrl = await page.evaluate(() => {
+      const dlg = document.querySelector('[role="dialog"]');
+      if (!dlg) return '';
+      const inp = dlg.querySelector('input[readonly], input[value*="http"]');
+      return inp ? inp.value : '';
+    });
+  }
+
+  await page.keyboard.press('Escape'); // закрыть диалог
+  await page.waitForTimeout(300);
+
+  if (!shareUrl || !shareUrl.startsWith('http')) {
+    throw new Error('Не удалось получить share-ссылку из диалога Share');
+  }
+
+  console.log(`🔗 Share-ссылка получена: ${shareUrl}`);
+  return shareUrl;
+}
+
+// На новом аккаунте: открыть share-ссылку и нажать Duplicate → чат клонируется со всеми файлами
+async function duplicateChatFromLink(shareUrl) {
+  await page.goto(shareUrl);
+  await page.waitForTimeout(3000);
+
+  const dupBtn = page.locator('button:has-text("Duplicate"), a:has-text("Duplicate")').first();
+  await dupBtn.waitFor({ state: 'visible', timeout: 20000 });
+  await dupBtn.click();
+
+  // Ждем редиректа в клонированный чат нового аккаунта
+  await page.waitForURL(/\/(chat|r)\//, { timeout: 30000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+
+  const newUrl = page.url();
+  console.log(`📋 Чат продублирован в новый аккаунт: ${newUrl}`);
+  return newUrl;
+}
+
+// Полный цикл переноса: share на старом → смена cookie → duplicate на новом
+async function migrateSessionToNextToken() {
+  const currentUrl = page.url();
+  const inChat = currentUrl.includes('/chat/') || currentUrl.includes('/r/');
+
+  let shareUrl = null;
+  if (inChat) {
+    try {
+      shareUrl = await enableSharingAndGetLink();
+    } catch (e) {
+      console.log(`⚠️ Share-link не получен (${e.message}). Полагаемся на БД-fallback.`);
+    }
+  }
+
+  const hasNext = await switchToNextToken();
+  if (!hasNext) return false;
+
+  if (shareUrl) {
+    try {
+      await duplicateChatFromLink(shareUrl);
+    } catch (e) {
+      console.log(`⚠️ Duplicate не удался (${e.message}). Пробуем открыть исходный URL.`);
+      if (inChat) await page.goto(currentUrl);
+    }
+  } else if (inChat) {
+    // Без share-ссылки приватный чат новому аккаунту недоступен — логируем fallback-состояние
+    if (lastChatState) {
+      console.log(`💾 Fallback: используем перехваченное состояние чата от ${lastChatState.capturedAt}`);
+      const dumpPath = path.join(outputDir, `chat-state-${Date.now()}.json`);
+      fs.writeFileSync(dumpPath, JSON.stringify(lastChatState, null, 2), 'utf-8');
+      console.log(`💾 Состояние сохранено: ${dumpPath}`);
+    }
+    await page.goto('https://v0.app');
+  } else {
+    await page.goto('https://v0.app');
+  }
+
+  return true;
 }
 
 async function switchToNextToken() {
@@ -89,7 +258,7 @@ async function checkIsPaywall(page) {
   return await page.evaluate(() => {
     const text = document.body.innerText;
     const modal = document.querySelector('[role="dialog"], div[class*="modal"]');
-    
+
     const paywallKeywords = [
       "Out of Credit",
       "out of credits",
@@ -103,8 +272,8 @@ async function checkIsPaywall(page) {
 
     const hasTextMatch = paywallKeywords.some(kw => text.includes(kw));
     const hasModalMatch = modal && (
-      modal.innerText.includes("Plus") || 
-      modal.innerText.includes("Upgrade") || 
+      modal.innerText.includes("Plus") ||
+      modal.innerText.includes("Upgrade") ||
       modal.innerText.includes("Billing")
     );
 
@@ -134,7 +303,7 @@ async function openModelMenu() {
     const btn = buttons.nth(i);
     const txt = (await btn.innerText()).trim();
     const isBad = ['Team', 'Upgrade', 'projects', 'Settings', 'Chat', 'Import', 'Template', 'Start'].some(word => txt.includes(word));
-    
+
     if (!isBad && txt.length > 0) {
       await btn.click();
       await page.waitForTimeout(500);
@@ -235,6 +404,15 @@ app.get('/api/models', async (req, res) => {
   }
 });
 
+// --- GET /api/chat-state — отладочный просмотр БД-fallback состояния ---
+app.get('/api/chat-state', (req, res) => {
+  res.json({
+    success: true,
+    lastChatState,
+    recentDbResponsesCount: dbSniffLog.length
+  });
+});
+
 // --- POST /api/generate ---
 app.post('/api/generate', async (req, res) => {
   try {
@@ -277,16 +455,9 @@ app.post('/api/generate', async (req, res) => {
       let isPaywall = await checkIsPaywall(page);
 
       if (isPaywall) {
-        console.log(`❌ На аккаунте #${currentTokenIndex + 1} закончились токены (Out of Credit)!`);
-        const chatUrlToContinue = page.url();
-        const hasNext = await switchToNextToken();
-        if (!hasNext) break;
-
-        if (chatUrlToContinue.includes('/chat/') || chatUrlToContinue.includes('/r/')) {
-          await page.goto(chatUrlToContinue);
-        } else {
-          await page.goto('https://v0.app');
-        }
+        console.log(`❌ На аккаунте #${currentTokenIndex + 1} закончились токены (Out of Credit)! Переносим сессию...`);
+        const migrated = await migrateSessionToNextToken();
+        if (!migrated) break;
         continue;
       }
 
@@ -297,16 +468,16 @@ app.post('/api/generate', async (req, res) => {
         await page.waitForFunction(() => {
           const text = document.body.innerText;
           const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="Cancel"]');
-          
-          const isWorking = text.includes("Generating") || 
-                            text.includes("Thinking") || 
+
+          const isWorking = text.includes("Generating") ||
+                            text.includes("Thinking") ||
                             text.includes("Installing") ||
                             text.includes("Executing") ||
                             text.includes("Building");
 
           return !!stopBtn || isWorking;
         }, { timeout: 15000 });
-        
+
         started = true;
         console.log('⚡ Генерация официально пошла!');
       } catch (e) {
@@ -320,14 +491,14 @@ app.post('/api/generate', async (req, res) => {
           await page.waitForFunction(() => {
             const text = document.body.innerText;
             const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="Cancel"]');
-            
-            const isPaywallPresent = text.includes("Out of Credit") || 
-                                     text.includes("out of credits") || 
+
+            const isPaywallPresent = text.includes("Out of Credit") ||
+                                     text.includes("out of credits") ||
                                      text.includes("Upgrade Plan") ||
                                      text.includes("Activate v0 Plus");
 
-            const isStillWorking = text.includes("Generating") || 
-                                   text.includes("Thinking") || 
+            const isStillWorking = text.includes("Generating") ||
+                                   text.includes("Thinking") ||
                                    text.includes("Installing") ||
                                    text.includes("Executing") ||
                                    text.includes("Building");
@@ -338,16 +509,9 @@ app.post('/api/generate', async (req, res) => {
           const hitPaywallDuringGen = await checkIsPaywall(page);
 
           if (hitPaywallDuringGen) {
-            console.log(`❌ Генерация прервана: На аккаунте #${currentTokenIndex + 1} закончились кредиты!`);
-            const chatUrlToContinue = page.url();
-            const hasNext = await switchToNextToken();
-            if (!hasNext) break;
-
-            if (chatUrlToContinue.includes('/chat/') || chatUrlToContinue.includes('/r/')) {
-              await page.goto(chatUrlToContinue);
-            } else {
-              await page.goto('https://v0.app');
-            }
+            console.log(`❌ Генерация прервана: у аккаунта #${currentTokenIndex + 1} закончились кредиты! Переносим сессию...`);
+            const migrated = await migrateSessionToNextToken();
+            if (!migrated) break;
             continue;
           }
 
