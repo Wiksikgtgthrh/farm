@@ -31,6 +31,15 @@ for (const dir of [promptsDir, promptsDoneDir]) {
 const TOKENS_FILE = path.join(process.cwd(), 'tokens.txt');
 const USED_TOKENS_FILE = path.join(process.cwd(), 'used_tokens.txt');
 
+// Разбирает строку вида "1)eyJhbGci..." или голый токен
+function parseTokenLine(line) {
+  const m = line.trim().match(/^(\d+)\)\s*(\S+)/);
+  if (m && m[2].length > 20) return { num: parseInt(m[1], 10), token: m[2] };
+  const bare = line.trim();
+  if (bare.length > 20 && !bare.includes('#')) return { num: null, token: bare };
+  return null;
+}
+
 function loadTokens() {
   if (!fs.existsSync(TOKENS_FILE)) {
     console.error('❌ Файл tokens.txt не найден!');
@@ -39,11 +48,12 @@ function loadTokens() {
   const rawContent = fs.readFileSync(TOKENS_FILE, 'utf-8');
   return rawContent
     .split(/[\r\n]+/)
-    .flatMap(line => line.split(/\s+/))
-    .map(t => t.replace(/['";]/g, '').trim())
-    .filter(t => t.length > 20)
-    .filter(t => !t.startsWith('U')); // на всякий случай: помеченные не подхватываем
+    .map(line => parseTokenLine(line))
+    .filter(Boolean)
+    .map(x => x.token);
 }
+
+
 
 // Токены перечитываем с диска при каждом обращении — файлы правит и сервер, и пользователь
 let tokensPool = loadTokens();
@@ -61,9 +71,12 @@ function markTokenUsedInFile(token) {
 
     const kept = [];
     let removed = false;
+    let originalNum = null;
     for (const line of lines) {
-      if (!removed && line.includes(token)) {
+      const parsed = parseTokenLine(line);
+      if (!removed && parsed && parsed.token === token) {
         removed = true; // вырезаем строку с токеном целиком
+        originalNum = parsed.num;
         continue;
       }
       kept.push(line);
@@ -73,11 +86,16 @@ function markTokenUsedInFile(token) {
     while (kept.length && kept[kept.length - 1].trim() === '') kept.pop();
     fs.writeFileSync(TOKENS_FILE, kept.join('\n') + (kept.length ? '\n' : ''), 'utf-8');
 
-    // В файл использованных — с префиксом U и меткой времени
+    // В файл использованных: порядковый номер исчерпания + исходный номер + токен
+    // Пример: "1)3)eyJhbGci..." — первым исчерпал аккаунт №3
     if (removed) {
       const stamp = new Date().toISOString();
-      fs.appendFileSync(USED_TOKENS_FILE, `U${token}  # used at ${stamp}\n`, 'utf-8');
-      console.log(`🗃️ Токен перенесен: tokens.txt → used_tokens.txt (помечен U)`);
+      const usageCount = fs.existsSync(USED_TOKENS_FILE)
+        ? fs.readFileSync(USED_TOKENS_FILE, 'utf-8').split(/\r?\n/).filter(l => l.trim()).length
+        : 0;
+      const prefix = originalNum != null ? `${usageCount + 1})${originalNum})` : `${usageCount + 1})`;
+      fs.appendFileSync(USED_TOKENS_FILE, `${prefix}${token}  # used at ${stamp}\n`, 'utf-8');
+      console.log(`🗃️ Токен перенесен: tokens.txt → used_tokens.txt (запись ${prefix}...)`);
     }
   } catch (e) {
     console.error(`⚠️ Не удалось обновить файлы токенов: ${e.message}`);
@@ -188,50 +206,82 @@ async function ensurePageAlive() {
 // --- Перенос сессии через share-ссылку ---
 
 // На текущем аккаунте: открыть Share → выставить "Anyone on the web" → вернуть ссылку
+// Каждый шаг ограничен по времени и логируется, чтобы перенос не зависал молча
 async function enableSharingAndGetLink() {
-  // 1. Открываем меню "..." в шапке чата и жмем Share, либо прямую кнопку Share
-  const directShare = page.locator('button:has-text("Share")').first();
-  if (await directShare.isVisible().catch(() => false)) {
-    await directShare.click();
-  } else {
-    const moreBtn = page.locator('button[aria-label="More"], button:has-text("...")').first();
-    if (await moreBtn.isVisible().catch(() => false)) {
-      await moreBtn.click();
-      await page.waitForTimeout(400);
-    }
-    await page.locator('[role="menuitem"]:has-text("Share"), button:has-text("Share")').first().click();
-  }
-  await page.waitForTimeout(1200);
+  // 1. Кнопка Share: прямая в шапке чата, либо внутри меню "..."
+  console.log('🔍 Шаг 1/4: ищу кнопку Share...');
+  let shareClicked = false;
 
-  // 2. В диалоге Share: дропдаун Visibility → "Anyone on the web"
-  const visibilityDropdown = page.locator(
-    '[role="dialog"] button:has-text("Only people with access"), [role="dialog"] [role="combobox"]:has-text("Only people")'
+  const directShare = page.locator('button:has-text("Share")').first();
+  if (await directShare.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await directShare.click();
+    shareClicked = true;
+  } else {
+    const moreBtn = page.locator('button[aria-label*="more" i], button[aria-label*="options" i], button[aria-label*="menu" i], button:has-text("..."), button:has-text("⋯")').first();
+    if (await moreBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await moreBtn.click();
+      await page.waitForTimeout(500);
+      const menuShare = page.locator('[role="menuitem"]:has-text("Share"), [role="menu"] button:has-text("Share"), [role="menu"] [role="menuitem"]:has-text("Share")').first();
+      await menuShare.click({ timeout: 4000 });
+      shareClicked = true;
+    }
+  }
+
+  if (!shareClicked) {
+    // Последняя надежда: иконка-стрелка/поделиться в шапке
+    const iconShare = page.locator('header button[aria-label*="share" i], button[aria-label*="share" i]').first();
+    if (await iconShare.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await iconShare.click();
+      shareClicked = true;
+    }
+  }
+
+  if (!shareClicked) throw new Error('кнопка Share не найдена на странице чата');
+  await page.waitForTimeout(1500);
+
+  // 2. Диалог Share открыт? Переключаем Visibility → "Anyone on the web"
+  console.log('🔍 Шаг 2/4: выставляю "Anyone on the web"...');
+  const dialog = page.locator('[role="dialog"]').last();
+  await dialog.waitFor({ state: 'visible', timeout: 5000 });
+
+  const visibilityDropdown = dialog.locator(
+    'button:has-text("Only people with access"), [role="combobox"]:has-text("Only people"), button:has-text("Only people")'
   ).first();
 
-  if (await visibilityDropdown.isVisible().catch(() => false)) {
+  if (await visibilityDropdown.isVisible({ timeout: 2500 }).catch(() => false)) {
     await visibilityDropdown.click();
-    await page.waitForTimeout(600);
-    await page.locator(
-      '[role="option"]:has-text("Anyone on the web"), [role="menuitem"]:has-text("Anyone on the web"), li:has-text("Anyone on the web")'
-    ).first().click();
-    await page.waitForTimeout(1000); // ждем применения настроек на сервере
+    await page.waitForTimeout(700);
+    const anyoneOption = page.locator(
+      '[role="option"]:has-text("Anyone on the web"), [role="menuitem"]:has-text("Anyone on the web"), [role="listbox"] *:has-text("Anyone on the web")'
+    ).first();
+    await anyoneOption.click({ timeout: 4000 });
+    await page.waitForTimeout(1500); // ждем применения настроек на сервере
+    console.log('🌐 Видимость переключена на "Anyone on the web"');
+  } else {
+    console.log('ℹ️ Дропдаун видимости не найден — возможно, чат уже публичный');
   }
 
-  // 3. Кликаем Copy Link и читаем ссылку
-  await page.locator('[role="dialog"] button:has-text("Copy Link"), button:has-text("Copy Link")').first().click();
-  await page.waitForTimeout(500);
+  // 3. Copy Link
+  console.log('🔍 Шаг 3/4: нажимаю Copy Link...');
+  const copyBtn = dialog.locator('button:has-text("Copy Link"), button:has-text("Copy link")').first();
+  await copyBtn.click({ timeout: 4000 });
+  await page.waitForTimeout(700);
 
+  // 4. Читаем ссылку: clipboard → input в диалоге
+  console.log('🔍 Шаг 4/4: читаю ссылку...');
   let shareUrl = '';
   try {
-    shareUrl = await page.evaluate(() => navigator.clipboard.readText());
+    shareUrl = await Promise.race([
+      page.evaluate(() => navigator.clipboard.readText()),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('clipboard timeout')), 3000))
+    ]);
   } catch (_) {}
 
-  // Fallback: иногда ссылка лежит в readonly input внутри диалога
   if (!shareUrl || !shareUrl.startsWith('http')) {
     shareUrl = await page.evaluate(() => {
       const dlg = document.querySelector('[role="dialog"]');
       if (!dlg) return '';
-      const inp = dlg.querySelector('input[readonly], input[value*="http"]');
+      const inp = dlg.querySelector('input[readonly], input[value*="http"], input[type="url"]');
       return inp ? inp.value : '';
     });
   }
@@ -240,7 +290,7 @@ async function enableSharingAndGetLink() {
   await page.waitForTimeout(300);
 
   if (!shareUrl || !shareUrl.startsWith('http')) {
-    throw new Error('Не удалось получить share-ссылку из диалога Share');
+    throw new Error('ссылка не прочитана ни из буфера, ни из поля диалога');
   }
 
   console.log(`🔗 Share-ссылка получена: ${shareUrl}`);
@@ -249,15 +299,17 @@ async function enableSharingAndGetLink() {
 
 // На новом аккаунте: открыть share-ссылку и нажать Duplicate → чат клонируется со всеми файлами
 async function duplicateChatFromLink(shareUrl) {
-  await page.goto(shareUrl);
+  console.log('🔍 Открываю share-ссылку на новом аккаунте...');
+  await page.goto(shareUrl, { timeout: 20000 });
   await page.waitForTimeout(3000);
 
-  const dupBtn = page.locator('button:has-text("Duplicate"), a:has-text("Duplicate")').first();
-  await dupBtn.waitFor({ state: 'visible', timeout: 20000 });
+  const dupBtn = page.locator('button:has-text("Duplicate"), a:has-text("Duplicate"), button:has-text("Fork"), button:has-text("Remix")').first();
+  await dupBtn.waitFor({ state: 'visible', timeout: 15000 });
+  console.log('🔍 Кнопка Duplicate найдена, кликаю...');
   await dupBtn.click();
 
   // Ждем редиректа в клонированный чат нового аккаунта
-  await page.waitForURL(/\/(chat|r)\//, { timeout: 30000 }).catch(() => {});
+  await page.waitForURL(/\/(chat|r)\//, { timeout: 25000 }).catch(() => {});
   await page.waitForTimeout(2500);
 
   const newUrl = page.url();
@@ -273,7 +325,11 @@ async function migrateSessionToNextToken() {
   let shareUrl = null;
   if (inChat) {
     try {
-      shareUrl = await enableSharingAndGetLink();
+      // Жесткий таймаут на весь share-ритуал — перенос не должен висеть
+      shareUrl = await Promise.race([
+        enableSharingAndGetLink(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('таймаут share-ритуала (30 сек)')), 30000))
+      ]);
     } catch (e) {
       console.log(`⚠️ Share-link не получен (${e.message}). Полагаемся на БД-fallback.`);
     }
