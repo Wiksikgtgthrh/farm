@@ -538,12 +538,33 @@ async function checkIsPaywall(page) {
 // Если Next не активен или нет вариантов — жмём Skip. Повторяем, пока модалка
 // не исчезнет или не упрёмся в лимит шагов.
 async function dismissClarifyingQuestions() {
-  const MAX_ROUNDS = 8;
+  const MAX_ROUNDS = 10;
   for (let round = 0; round < MAX_ROUNDS; round++) {
-    // Ищем модалку-опросник: radio/checkbox + Next или Skip + "N of M"/"Step N"
-    const dlg = page.locator('[role="dialog"]').last();
-    const visible = await dlg.isVisible({ timeout: 1500 }).catch(() => false);
-    if (!visible) return; // модалки нет — вопросов не было или все пройдены
+    // Кандидат — любой видимый блок с прогрессом "N of M" и Skip/Next.
+    // Не привязываемся к [role="dialog"] (на скриншоте role мог быть другим).
+    const dlg = await page.evaluate(() => {
+      const blocks = Array.from(document.querySelectorAll(
+        '[role="dialog"], [data-testid*="question"], [data-testid*="survey"], ' +
+        '[class*="modal"], [class*="Modal"], [class*="dialog"], [class*="Dialog"], ' +
+        '[class*="question"], [class*="Question"], [class*="onboard"], [class*="Onboard"]'
+      ));
+      for (const b of blocks) {
+        const rect = b.getBoundingClientRect();
+        if (rect.width < 100 || rect.height < 60) continue;
+        const txt = (b.innerText || '').toLowerCase();
+        const hasProgress = /\d\s*(of|из|\/)\s*\d/.test(txt) || txt.includes('step ');
+        const hasOptions = !!b.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]');
+        const btnTexts = Array.from(b.querySelectorAll('button')).map(x => (x.innerText || '').toLowerCase().trim());
+        const hasSkip = btnTexts.some(t => t === 'skip' || t === 'пропустить');
+        const hasNext = btnTexts.some(t => t === 'next' || t === 'далее' || t === 'continue');
+        if ((hasProgress || hasOptions) && (hasSkip || hasNext)) {
+          return { found: true, hasSkip };
+        }
+      }
+      return { found: false };
+    }).catch(() => ({ found: false }));
+
+    if (!dlg.found) return; // вопросов нет — выходим
 
     const dlgText = (await dlg.innerText().catch(() => '')).toLowerCase();
     const isQuestionnaire = dlgText.includes('of 3') ||
@@ -556,50 +577,55 @@ async function dismissClarifyingQuestions() {
       return;
     }
 
-    console.log(`💬 Обнаружен уточняющий вопрос v0 (раунд ${round + 1}) — отвечаю первым вариантом...`);
+    console.log(`💬 Раунд ${round + 1}: найден уточняющий вопрос v0.`);
 
-    // Жмём первый вариант (radio/checkbox или clickable row)
-    const firstOption = dlg.locator('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]').first();
+    // 1) Пытаемся Skip — он закрывает ВСЕ оставшиеся шаги разом и стартует
+    //    генерацию с дефолтами v0. Это надёжнее, чем подбор варианта.
+    const skipBtn = page.locator('button:has-text("Skip"), button:has-text("Пропустить")').first();
+    if (await skipBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await skipBtn.click({ force: true, timeout: 3000 }).catch(() => {});
+      console.log('   ↳ Нажали Skip — пропускаем все вопросы.');
+      await page.waitForTimeout(1200);
+      continue;
+    }
+
+    // 2) Skip нет — отвечаем первым вариантом + Next.
+    const firstOption = page.locator('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]').first();
     if (await firstOption.isVisible({ timeout: 2000 }).catch(() => false)) {
       await firstOption.click({ force: true }).catch(() => {});
     } else {
-      // Возможно, варианты — кликабельные строки без input
-      const row = dlg.locator('label, [role="option"], button').first();
+      // варианты могут быть кликабельными строками без input
+      const row = page.locator('[role="option"], label').first();
       if (await row.isVisible({ timeout: 1500 }).catch(() => false)) {
         await row.click({ force: true }).catch(() => {});
       }
     }
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(500);
 
-    // Жмём Next (если он стал активным после выбора). Иначе — Skip.
-    const nextBtn = dlg.locator('button:has-text("Next"), button:has-text("Далее"), button:has-text("Continue")').first();
-    let clickedNext = false;
+    const nextBtn = page.locator('button:has-text("Next"), button:has-text("Далее"), button:has-text("Continue")').first();
+    let advanced = false;
     if (await nextBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
       const disabled = await nextBtn.getAttribute('disabled');
       const ariaDisabled = await nextBtn.getAttribute('aria-disabled');
       if (disabled === null && ariaDisabled !== 'true') {
         await nextBtn.click({ force: true }).catch(() => {});
-        clickedNext = true;
+        advanced = true;
+        console.log('   ↳ Выбрали первый вариант, нажали Next.');
       }
     }
-    if (!clickedNext) {
-      const skipBtn = dlg.locator('button:has-text("Skip"), button:has-text("Пропустить")').first();
-      if (await skipBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
-        await skipBtn.click({ force: true }).catch(() => {});
-        console.log('   ↳ Next недоступен — нажали Skip.');
-      } else {
-        // Ни Next, ни Skip не нашлись — закрываем крестиком, чтобы не зависнуть
-        const closeBtn = dlg.locator('button[aria-label*="close" i], button[aria-label*="Close"], [aria-label*="close" i]').first();
-        if (await closeBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
-          await closeBtn.click({ force: true }).catch(() => {});
-          console.log('   ↳ Ни Next, ни Skip — закрыли модалку.');
-        }
-        return;
+    if (!advanced) {
+      // Next не активен/нет — закрываем крестиком, чтобы не зависнуть
+      const closeBtn = page.locator('button[aria-label*="close" i], button[aria-label*="Close"], [aria-label*="close" i], button:has-text("Cancel"), button:has-text("Отмена")').first();
+      if (await closeBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await closeBtn.click({ force: true }).catch(() => {});
+        console.log('   ↳ Next недоступен — закрыли модалку.');
       }
+      await page.waitForTimeout(800);
+      return;
     }
-    await page.waitForTimeout(700);
+    await page.waitForTimeout(900);
   }
-  console.log('⚠️ Достигнут лимит раундов автоответчика (8) — выходим, возможно остались вопросы.');
+  console.log('⚠️ Достигнут лимит раундов автоответчика (10).');
 }
 
 // Поиск и клик по меню выбора моделей
