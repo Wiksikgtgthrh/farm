@@ -1,0 +1,20 @@
+{
+  "name": "wiks",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "axios": "^1.18.1",
+    "express": "^5.2.1",
+    "playwright": "^1.40.0",
+    "v0-api": "^0.0.4",
+    "v0-sdk": "^0.16.4"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
