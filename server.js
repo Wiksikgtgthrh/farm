@@ -115,11 +115,31 @@ function markTokenUsedInFile(token) {
 // Пул мог обновиться снаружи (докинули токены в tokens.txt) — перечитываем
 function refreshTokensPool() {
   const fresh = loadTokens();
+
+  // Перестраиваем exhausted из used_tokens.txt: что реально лежит в отработанных,
+  // то и считаем исчерпанным. Ручной возврат токена (вырезал из used_tokens.txt
+  // и положил обратно в tokens.txt) теперь снова делает его активным.
+  const usedSet = new Set();
+  if (fs.existsSync(USED_TOKENS_FILE)) {
+    const usedRaw = fs.readFileSync(USED_TOKENS_FILE, 'utf-8').split(/\r?\n/);
+    for (const line of usedRaw) {
+      const parsed = parseTokenLine(line);
+      if (parsed) usedSet.add(parsed.token);
+    }
+  }
+  // Оставляем в exhausted только те, что либо уже не в активном пуле, либо помечены в used
+  const freshSet = new Set(fresh);
+  const newExhausted = new Set();
+  for (const t of exhaustedTokens) {
+    if (!freshSet.has(t) || usedSet.has(t)) newExhausted.add(t);
+  }
+  exhaustedTokens.clear();
+  for (const t of newExhausted) exhaustedTokens.add(t);
+
   if (fresh.length !== tokensPool.length || fresh.some(t => !tokensPool.includes(t))) {
     tokensPool = fresh;
-    // Выкинуть из exhausted то, чего больше нет в файле used (пользователь вернул токен вручную)
     if (tokensPool.length > 0) currentTokenIndex = currentTokenIndex % tokensPool.length;
-    console.log(`🔑 Пул токенов обновлен с диска: ${tokensPool.length} шт.`);
+    console.log(`🔑 Пул токенов обновлен с диска: ${tokensPool.length} шт. (исчерпано: ${exhaustedTokens.size})`);
   }
 }
 
@@ -175,14 +195,64 @@ function attachDbSniffer(targetPage) {
 
 async function setSessionCookie(token) {
   await context.clearCookies();
+  // domain с ведущей точкой покрывает v0.app и все поддомены (chat, app и т.д.)
+  // sameSite: 'Lax' + secure — стандартный профиль сессионной куки v0, иначе браузер режет куку
   await context.addCookies([{
     name: 'user_session',
     value: token,
-    domain: 'v0.app',
+    domain: '.v0.app',
     path: '/',
     httpOnly: true,
-    secure: true
+    secure: true,
+    sameSite: 'Lax'
   }]);
+}
+
+// Проверяет, что текущая страница реально авторизована под выставленным токеном.
+// v0 при битом/expired токене редиректит на /login и показывает «Sign in»/«Log in».
+async function isAuthorized() {
+  const url = page.url();
+  if (url.includes('/login') || url.includes('/signin') || url.includes('/auth')) return false;
+  try {
+    return await page.evaluate(() => {
+      const text = (document.body && document.body.innerText) || '';
+      // На неавторизованном экране нет поля ввода, зато есть кнопки входа
+      const hasInput = !!document.querySelector('textarea, [contenteditable="true"]');
+      const hasSignIn = /\b(Sign in|Log in|Sign up|Create account|Continue with)\b/i.test(text)
+                        && !hasInput;
+      return hasInput || !hasSignIn;
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
+// Перебирает токены, пока не добьётся авторизованной страницы.
+// Выкидывает исчерпанные/битые токены так же, как при Out of Credit.
+async function ensureAuthorized() {
+  refreshTokensPool();
+  if (tokensPool.length === 0) {
+    throw Object.assign(new Error('Пул токенов пуст — добавьте валидные токены в tokens.txt'), { statusCode: 401 });
+  }
+
+  let authTries = 0;
+  while (authTries <= tokensPool.length) {
+    await page.goto('https://v0.app', { timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+
+    if (await isAuthorized()) return true;
+
+    const idx = currentTokenIndex % tokensPool.length;
+    const badToken = tokensPool[idx];
+    console.log(`🔒 Аккаунт #${idx + 1} не авторизован (битый/протухший токен) — выбраковываем.`);
+    markTokenUsedInFile(badToken);
+
+    if (tokensPool.length === 0) break;
+    // markTokenUsedInFile уже выставил currentTokenIndex на свежий токен
+    authTries++;
+  }
+
+  throw Object.assign(new Error('Ни один токен не прошёл авторизацию — добавьте валидные токены в tokens.txt'), { statusCode: 401 });
 }
 
 async function ensurePageAlive() {
@@ -200,6 +270,8 @@ async function ensurePageAlive() {
     page = await context.newPage();
     attachDbSniffer(page);
     await page.goto('https://v0.app');
+    // На старом/битом токене v0 выкинет на /login — перебираем токены до авторизованного
+    await ensureAuthorized();
   }
 }
 
@@ -341,12 +413,19 @@ async function migrateSessionToNextToken() {
   if (shareUrl) {
     try {
       await duplicateChatFromLink(shareUrl);
+      // После duplicate убеждаемся, что новый аккаунт реально авторизован
+      // (share-ссылка публичная, но кука могла не встать)
+      if (!(await isAuthorized())) {
+        console.log('🔒 После Duplicate страница не авторизована — перебираем токены.');
+        await ensureAuthorized();
+      }
     } catch (e) {
-      console.log(`⚠️ Duplicate не удался (${e.message}). Пробуем открыть исходный URL.`);
-      if (inChat) await page.goto(currentUrl);
+      console.log(`⚠️ Duplicate не удался (${e.message}). Открываем стартовую v0.app.`);
+      await page.goto('https://v0.app');
     }
   } else if (inChat) {
-    // Без share-ссылки приватный чат новому аккаунту недоступен — логируем fallback-состояние
+    // Без share-ссылки приватный чат старого аккаунта новому недоступен —
+    // НЕ открываем старый URL (приватный, даст 404/login), идём на стартовую
     if (lastChatState) {
       console.log(`💾 Fallback: используем перехваченное состояние чата от ${lastChatState.capturedAt}`);
       const dumpPath = path.join(outputDir, `chat-state-${Date.now()}.json`);
@@ -362,6 +441,7 @@ async function migrateSessionToNextToken() {
 }
 
 async function switchToNextToken() {
+  refreshTokensPool();
   if (tokensPool.length === 0) {
     console.error('🚨 Пул токенов пуст! Докиньте токенов в tokens.txt');
     return false;
@@ -381,6 +461,17 @@ async function switchToNextToken() {
       currentTokenIndex = i;
       console.log(`🔄 Переключились на аккаунт #${i + 1} (свежих токенов в пуле: ${tokensPool.length - exhaustedTokens.size})`);
       await setSessionCookie(candidate);
+      // Обязательно перезагружаем страницу — иначе UI остаётся в старой сессии
+      await page.goto('https://v0.app', { timeout: 20000 }).catch(() => {});
+      await page.waitForTimeout(2000);
+
+      // Новый токен может оказаться битым/протухшим — проверяем авторизацию,
+      // при необходимости подбираем следующий валидный
+      if (!(await isAuthorized())) {
+        console.log(`🔒 Аккаунт #${i + 1} не авторизован после переключения — ищем дальше.`);
+        exhaustedTokens.add(candidate);
+        continue;
+      }
       return true;
     }
   }
@@ -588,12 +679,25 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
 
   while (attempts < tokensPool.length) {
     attempts++;
+    // Перед каждой попыткой перечитываем пул — пользователь мог докинуть токенов
+    refreshTokensPool();
+    if (tokensPool.length === 0) break;
+    currentTokenIndex = currentTokenIndex % tokensPool.length;
+
     console.log(`\n🚀 Запуск генерации (Аккаунт #${(currentTokenIndex % tokensPool.length) + 1})...`);
     console.log(`📝 Промпт: "${prompt.slice(0, 120)}${prompt.length > 120 ? '…' : ''}"`);
 
     const currentUrl = page.url();
     if (!currentUrl.includes('/chat/') && !currentUrl.includes('/r/')) {
       await page.goto('https://v0.app');
+    }
+
+    // Проверяем авторизацию перед отправкой: битый токен даёт /login и input не найдётся
+    if (!(await isAuthorized())) {
+      console.log(`🔒 Аккаунт #${(currentTokenIndex % tokensPool.length) + 1} не авторизован — переключаемся.`);
+      const switched = await switchToNextToken();
+      if (!switched) break;
+      continue;
     }
 
     const inputSelector = 'textarea, [contenteditable="true"]';
