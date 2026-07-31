@@ -31,8 +31,21 @@ for (const dir of [promptsDir, promptsDoneDir]) {
 const TOKENS_FILE = path.join(process.cwd(), 'tokens.txt');
 const USED_TOKENS_FILE = path.join(process.cwd(), 'used_tokens.txt');
 
-// Разбирает строку вида "1)eyJhbGci..." или голый токен
+// Разбирает строку с токеном. Поддерживает форматы:
+//   1)eyJhbGci...            — нумерованный активный
+//   eyJhbGci...              — голый токен
+//   1)3)eyJhbGci... # used at 2026-... — отработанный из used_tokens.txt
+// JWT выцепляем по сигнатуре (eyJ... . ... . ...), игнорируя префиксы и комментарии.
 function parseTokenLine(line) {
+  if (!line) return null;
+  // Ищем JWT: три base64-сегмента через точку, начинающихся с eyJ
+  const jwtMatch = line.match(/(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/);
+  if (jwtMatch) {
+    // Исходный номер аккаунта: первый N) в строке
+    const numMatch = line.match(/^\s*(\d+)\)/);
+    return { num: numMatch ? parseInt(numMatch[1], 10) : null, token: jwtMatch[1] };
+  }
+  // Старый формат без явного JWT-вида, но длинный и без комментария
   const m = line.trim().match(/^(\d+)\)\s*(\S+)/);
   if (m && m[2].length > 20) return { num: parseInt(m[1], 10), token: m[2] };
   const bare = line.trim();
@@ -209,50 +222,60 @@ async function setSessionCookie(token) {
 }
 
 // Проверяет, что текущая страница реально авторизована под выставленным токеном.
-// v0 при битом/expired токене редиректит на /login и показывает «Sign in»/«Log in».
+// Надёжный сигнал авторизации — наличие поля ввода промпта (textarea / contenteditable).
+// v0 при битом/expired токене редиректит на /login, где поля ввода нет.
 async function isAuthorized() {
   const url = page.url();
   if (url.includes('/login') || url.includes('/signin') || url.includes('/auth')) return false;
   try {
-    return await page.evaluate(() => {
-      const text = (document.body && document.body.innerText) || '';
-      // На неавторизованном экране нет поля ввода, зато есть кнопки входа
-      const hasInput = !!document.querySelector('textarea, [contenteditable="true"]');
-      const hasSignIn = /\b(Sign in|Log in|Sign up|Create account|Continue with)\b/i.test(text)
-                        && !hasInput;
-      return hasInput || !hasSignIn;
-    });
+    // Ждём до 12 сек появления поля ввода — это ПОЛОЖИТЕЛЬНЫЙ сигнал.
+    // Если поле появилось — авторизованы. Если за 12 сек не появилось — неоднозначно.
+    await page.waitForSelector('textarea, [contenteditable="true"]', { timeout: 12000 });
+    return true;
   } catch (_) {
     return false;
   }
 }
 
 // Перебирает токены, пока не добьётся авторизованной страницы.
-// Выкидывает исчерпанные/битые токены так же, как при Out of Credit.
+// ВАЖНО: при неоднозначной авторизации НЕ переносим токен в used_tokens.txt —
+// это могла быть медленная отрисовка SPA или временный редирект. Просто
+// переходим к следующему кандидату в памяти, не трогая файлы.
+// В used_tokens.txt токен попадает только при явном Out of Credit (markTokenUsedInFile).
 async function ensureAuthorized() {
   refreshTokensPool();
   if (tokensPool.length === 0) {
     throw Object.assign(new Error('Пул токенов пуст — добавьте валидные токены в tokens.txt'), { statusCode: 401 });
   }
 
-  let authTries = 0;
-  while (authTries <= tokensPool.length) {
-    await page.goto('https://v0.app', { timeout: 20000 }).catch(() => {});
-    await page.waitForTimeout(2000);
-
-    if (await isAuthorized()) return true;
-
-    const idx = currentTokenIndex % tokensPool.length;
-    const badToken = tokensPool[idx];
-    console.log(`🔒 Аккаунт #${idx + 1} не авторизован (битый/протухший токен) — выбраковываем.`);
-    markTokenUsedInFile(badToken);
-
+  const tried = new Set();
+  for (let attempt = 0; attempt <= tokensPool.length; attempt++) {
     if (tokensPool.length === 0) break;
-    // markTokenUsedInFile уже выставил currentTokenIndex на свежий токен
-    authTries++;
+    const idx = currentTokenIndex % tokensPool.length;
+    const candidate = tokensPool[idx];
+    if (tried.has(candidate)) {
+      // Уже пробовали этот — двигаем индекс к следующему
+      currentTokenIndex = (currentTokenIndex + 1) % tokensPool.length;
+      continue;
+    }
+    tried.add(candidate);
+
+    await setSessionCookie(candidate);
+    await page.goto('https://v0.app', { timeout: 20000 }).catch(() => {});
+
+    if (await isAuthorized()) {
+      console.log(`✅ Аккаунт #${idx + 1} авторизован.`);
+      return true;
+    }
+
+    console.log(`🔒 Аккаунт #${idx + 1} не показал поле ввода — пропускаем (токен в файле оставляем).`);
+    currentTokenIndex = (currentTokenIndex + 1) % tokensPool.length;
   }
 
-  throw Object.assign(new Error('Ни один токен не прошёл авторизацию — добавьте валидные токены в tokens.txt'), { statusCode: 401 });
+  throw Object.assign(
+    new Error('Ни один токен не прошёл авторизацию за отведённое время. Возможно, v0 медленно грузится — попробуйте перезапустить, или обновите токены в tokens.txt'),
+    { statusCode: 401 }
+  );
 }
 
 async function ensurePageAlive() {
@@ -465,10 +488,11 @@ async function switchToNextToken() {
       await page.goto('https://v0.app', { timeout: 20000 }).catch(() => {});
       await page.waitForTimeout(2000);
 
-      // Новый токен может оказаться битым/протухшим — проверяем авторизацию,
-      // при необходимости подбираем следующий валидный
+      // Новый токен может оказаться неавторизованным — проверяем.
+      // При неудаче НЕ переносим в used_tokens.txt (это могла быть медленная
+      // отрисовка), просто помечаем в памяти как пропущенный и ищем дальше.
       if (!(await isAuthorized())) {
-        console.log(`🔒 Аккаунт #${i + 1} не авторизован после переключения — ищем дальше.`);
+        console.log(`🔒 Аккаунт #${i + 1} не показал поле ввода после переключения — пропускаем (токен в файле оставляем).`);
         exhaustedTokens.add(candidate);
         continue;
       }
