@@ -3,13 +3,29 @@ import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
 
-const app = express();
-app.use(express.json());
+// Фикс кодировки консоли Windows: иначе русские логи и промпты превращаются в "??????"
+if (process.platform === 'win32') {
+  try {
+    const { execSync } = await import('child_process');
+    execSync('chcp 65001', { stdio: 'ignore' });
+    process.stdout.setDefaultEncoding('utf8');
+  } catch (_) {}
+}
 
-// Создаем папку output один раз при запуске
+const app = express();
+app.use(express.json({ limit: '5mb' }));
+
+// Создаем папки один раз при запуске
 const outputDir = path.join(process.cwd(), 'output');
 if (!fs.existsSync(outputDir)) {
   fs.mkdirSync(outputDir, { recursive: true });
+}
+
+// Файловый режим: prompts/ — сюда кладут .txt с промптом, prompts/done/ — отчеты
+const promptsDir = path.join(process.cwd(), 'prompts');
+const promptsDoneDir = path.join(promptsDir, 'done');
+for (const dir of [promptsDir, promptsDoneDir]) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
 const TOKENS_FILE = path.join(process.cwd(), 'tokens.txt');
@@ -413,192 +429,278 @@ app.get('/api/chat-state', (req, res) => {
   });
 });
 
+// --- Файловый режим: парсер .txt с промптом ---
+// Формат файла (UTF-8):
+//   первая строка — необязательно "model: <имя модели>"
+//   остальные строки — текст промпта (русский ок, кодировка UTF-8)
+function parsePromptFile(rawText, fallbackModel) {
+  const lines = rawText.replace(/^﻿/, '').split(/\r?\n/);
+  let model = fallbackModel;
+  let startIdx = 0;
+
+  const firstLine = (lines[0] || '').trim();
+  const modelMatch = firstLine.match(/^model\s*:\s*(.+)$/i);
+  if (modelMatch) {
+    model = modelMatch[1].trim();
+    startIdx = 1;
+  }
+
+  const prompt = lines.slice(startIdx).join('\n').trim();
+  return { prompt, model };
+}
+
+// --- Основной сценарий генерации, общий для HTTP и файлового режима ---
+async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputSubDir = null }) {
+  const saveDir = outputSubDir ? path.join(outputDir, outputSubDir) : outputDir;
+
+  if (exhaustedTokens.size === tokensPool.length && tokensPool.length > 0) {
+    const err = new Error('Все аккаунты исчерпали баланс');
+    err.statusCode = 429;
+    throw err;
+  }
+
+  await ensurePageAlive();
+
+  let attempts = 0;
+
+  while (attempts < tokensPool.length) {
+    attempts++;
+    console.log(`\n🚀 Запуск генерации (Аккаунт #${currentTokenIndex + 1})...`);
+    console.log(`📝 Промпт: "${prompt.slice(0, 120)}${prompt.length > 120 ? '…' : ''}"`);
+
+    const currentUrl = page.url();
+    if (!currentUrl.includes('/chat/') && !currentUrl.includes('/r/')) {
+      await page.goto('https://v0.app');
+    }
+
+    const inputSelector = 'textarea, [contenteditable="true"]';
+    await page.waitForSelector(inputSelector, { timeout: 15000 });
+
+    // Выбор модели
+    await selectModelInUI(model);
+
+    // 1. Отправка промпта
+    await page.fill(inputSelector, prompt);
+    await page.keyboard.press('Enter');
+
+    // Даем UI 2 секунды на реакцию (вдруг вылезет модалка Out of Credit)
+    await page.waitForTimeout(2000);
+
+    // 2. МГНОВЕННАЯ ПРОВЕРКА НА ЛИМИТ КРЕДИТОВ
+    let isPaywall = await checkIsPaywall(page);
+
+    if (isPaywall) {
+      console.log(`❌ На аккаунте #${currentTokenIndex + 1} закончились токены (Out of Credit)! Переносим сессию...`);
+      const migrated = await migrateSessionToNextToken();
+      if (!migrated) break;
+      continue;
+    }
+
+    // 3. ЖДЕМ СТАРТА
+    console.log('⏳ Ждем запуск генерации на сервере v0...');
+    let started = false;
+    try {
+      await page.waitForFunction(() => {
+        const text = document.body.innerText;
+        const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="Cancel"]');
+
+        const isWorking = text.includes("Generating") ||
+                          text.includes("Thinking") ||
+                          text.includes("Installing") ||
+                          text.includes("Executing") ||
+                          text.includes("Building");
+
+        return !!stopBtn || isWorking;
+      }, { timeout: 15000 });
+
+      started = true;
+      console.log('⚡ Генерация официально пошла!');
+    } catch (e) {
+      console.log('⚠️ Статус генерации не засечен за 15 сек, но продолжаем контроль...');
+    }
+
+    // 4. ЖДЕМ ФИНИША (с динамическим отслеживанием пейволла)
+    if (started) {
+      console.log('⏳ Ждем полного завершения всех шагов v0...');
+      try {
+        await page.waitForFunction(() => {
+          const text = document.body.innerText;
+          const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="Cancel"]');
+
+          const isPaywallPresent = text.includes("Out of Credit") ||
+                                   text.includes("out of credits") ||
+                                   text.includes("Upgrade Plan") ||
+                                   text.includes("Activate v0 Plus");
+
+          const isStillWorking = text.includes("Generating") ||
+                                 text.includes("Thinking") ||
+                                 text.includes("Installing") ||
+                                 text.includes("Executing") ||
+                                 text.includes("Building");
+
+          return isPaywallPresent || (!stopBtn && !isStillWorking);
+        }, { timeout: 240000 });
+
+        const hitPaywallDuringGen = await checkIsPaywall(page);
+
+        if (hitPaywallDuringGen) {
+          console.log(`❌ Генерация прервана: у аккаунта #${currentTokenIndex + 1} закончились кредиты! Переносим сессию...`);
+          const migrated = await migrateSessionToNextToken();
+          if (!migrated) break;
+          continue;
+        }
+
+        console.log('✨ Код сгенерирован! Ждем 4 сек на финализацию файлового дерева...');
+        await page.waitForTimeout(4000);
+        console.log('🎯 Генерация 100% окончена!');
+      } catch (e) {
+        throw new Error("Таймаут: генерация заняла больше 4 минут.");
+      }
+    } else {
+      console.log('⏳ Ожидаем 25 секунд на случай быстрой генерации...');
+      await page.waitForTimeout(25000);
+    }
+
+    // 5. ПЕРЕКЛЮЧАЕМСЯ НА ТАБ CODE И СОБИРАЕМ ФАЙЛЫ
+    try {
+      const codeTab = page.locator('button:has-text("Code"), [role="tab"]:has-text("Code")').first();
+      if (await codeTab.isVisible()) {
+        await codeTab.click();
+        await page.waitForTimeout(800);
+      }
+    } catch (e) {}
+
+    console.log('📦 Сборка файлов проекта...');
+    const filesData = await page.evaluate(async () => {
+      const resultFiles = [];
+      const fileElements = Array.from(document.querySelectorAll('[data-filename], button[class*="file"], div[class*="file-item"]'));
+
+      if (fileElements.length > 0) {
+        for (const el of fileElements) {
+          const filePath = el.getAttribute('data-filename') || el.innerText.trim();
+          if (!filePath || !filePath.includes('.')) continue;
+
+          el.click();
+          await new Promise(r => setTimeout(r, 400));
+          const codeElement = document.querySelector('.monaco-editor, pre, code');
+          if (codeElement) {
+            resultFiles.push({ relativePath: filePath, content: codeElement.innerText });
+          }
+        }
+      }
+
+      if (resultFiles.length === 0) {
+        const codeElement = document.querySelector('.monaco-editor, pre, code');
+        if (codeElement) {
+          resultFiles.push({ relativePath: 'components/generated-component.tsx', content: codeElement.innerText });
+        }
+      }
+
+      return resultFiles;
+    });
+
+    // Сохраняем файлы в папку output (или output/<имя-задачи> для файлового режима)
+    if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
+    const savedFilesInfo = [];
+    for (const file of filesData) {
+      const fullPath = path.join(saveDir, file.relativePath);
+      const dirName = path.dirname(fullPath);
+
+      if (!fs.existsSync(dirName)) {
+        fs.mkdirSync(dirName, { recursive: true });
+      }
+      fs.writeFileSync(fullPath, file.content, 'utf-8');
+      savedFilesInfo.push(file.relativePath);
+      console.log(`  └─ Сохранен: ${path.relative(process.cwd(), fullPath)}`);
+    }
+
+    return {
+      success: true,
+      chatUrl: page.url(),
+      modelUsed: model,
+      accountUsed: currentTokenIndex + 1,
+      filesSaved: savedFilesInfo,
+      stats: {
+        totalAccounts: tokensPool.length,
+        exhaustedAccountsCount: exhaustedTokens.size,
+        activeAccountsRemaining: tokensPool.length - exhaustedTokens.size
+      }
+    };
+  }
+
+  const err = new Error('Все аккаунты исчерпали лимит');
+  err.statusCode = 429;
+  throw err;
+}
+
+// --- Файловый вотчер: сканирует prompts/ каждые 2 сек ---
+let fileJobRunning = false;
+
+async function processPromptFiles() {
+  if (fileJobRunning) return;
+
+  const files = fs.readdirSync(promptsDir)
+    .filter(f => f.toLowerCase().endsWith('.txt'))
+    .sort();
+
+  if (files.length === 0) return;
+
+  fileJobRunning = true;
+  const fileName = files[0];
+  const jobName = path.basename(fileName, '.txt').replace(/[<>:"/\\|?*]/g, '_');
+  const filePath = path.join(promptsDir, fileName);
+
+  try {
+    console.log(`\n📄 Найден файл промпта: prompts/${fileName}`);
+    const rawText = fs.readFileSync(filePath, 'utf-8');
+    const { prompt, model } = parsePromptFile(rawText, 'Opus 5');
+
+    if (!prompt) {
+      console.log('⚠️ Файл пустой — промпт не найден, файл удален.');
+      fs.unlinkSync(filePath);
+      return;
+    }
+
+    console.log(`🤖 Модель из файла: ${model}`);
+    const result = await runGeneration({ prompt, model, jobName, outputSubDir: jobName });
+
+    // Архивируем файл и пишем отчет рядом
+    const doneFile = path.join(promptsDoneDir, fileName);
+    fs.renameSync(filePath, doneFile);
+    fs.writeFileSync(doneFile.replace(/\.txt$/i, '.result.json'), JSON.stringify(result, null, 2), 'utf-8');
+    console.log(`✅ Задача "${jobName}" готова: файлы в output/${jobName}/, отчет в prompts/done/`);
+
+  } catch (err) {
+    console.error(`❌ Задача из файла "${fileName}" завершилась ошибкой: ${err.message}`);
+    // Файл не удаляем — можно исправить/дождаться сброса кредитов и переименовать, чтобы переиграть
+    const failReport = path.join(promptsDoneDir, fileName.replace(/\.txt$/i, '.error.txt'));
+    fs.writeFileSync(failReport, `${new Date().toISOString()}\n${err.message}`, 'utf-8');
+    // Убираем исходник из очереди, чтобы не крутить его бесконечно
+    try { fs.renameSync(filePath, path.join(promptsDoneDir, fileName)); } catch (_) {}
+  } finally {
+    fileJobRunning = false;
+  }
+}
+
+setInterval(() => {
+  processPromptFiles().catch(e => console.error('❌ Вотчер упал:', e.message));
+}, 2000);
+
 // --- POST /api/generate ---
 app.post('/api/generate', async (req, res) => {
   try {
     const { prompt, model = 'Opus 5' } = req.body;
     if (!prompt) return res.status(400).json({ error: 'Промпт не передан' });
 
-    if (exhaustedTokens.size === tokensPool.length && tokensPool.length > 0) {
-      return res.status(429).json({ error: 'Все аккаунты исчерпали баланс' });
-    }
-
-    await ensurePageAlive();
-
-    let success = false;
-    let attempts = 0;
-
-    while (!success && attempts < tokensPool.length) {
-      attempts++;
-      console.log(`\n🚀 Запуск генерации (Аккаунт #${currentTokenIndex + 1})...`);
-      console.log(`📝 Промпт: "${prompt}"`);
-
-      const currentUrl = page.url();
-      if (!currentUrl.includes('/chat/') && !currentUrl.includes('/r/')) {
-        await page.goto('https://v0.app');
-      }
-
-      const inputSelector = 'textarea, [contenteditable="true"]';
-      await page.waitForSelector(inputSelector, { timeout: 15000 });
-
-      // Выбор модели
-      await selectModelInUI(model);
-
-      // 1. Отправка промпта
-      await page.fill(inputSelector, prompt);
-      await page.keyboard.press('Enter');
-
-      // Даем UI 2 секунды на реакцию (вдруг вылезет модалка Out of Credit)
-      await page.waitForTimeout(2000);
-
-      // 2. МГНОВЕННАЯ ПРОВЕРКА НА ЛИМИТ КРЕДИТОВ
-      let isPaywall = await checkIsPaywall(page);
-
-      if (isPaywall) {
-        console.log(`❌ На аккаунте #${currentTokenIndex + 1} закончились токены (Out of Credit)! Переносим сессию...`);
-        const migrated = await migrateSessionToNextToken();
-        if (!migrated) break;
-        continue;
-      }
-
-      // 3. ЖДЕМ СТАРТА
-      console.log('⏳ Ждем запуск генерации на сервере v0...');
-      let started = false;
-      try {
-        await page.waitForFunction(() => {
-          const text = document.body.innerText;
-          const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="Cancel"]');
-
-          const isWorking = text.includes("Generating") ||
-                            text.includes("Thinking") ||
-                            text.includes("Installing") ||
-                            text.includes("Executing") ||
-                            text.includes("Building");
-
-          return !!stopBtn || isWorking;
-        }, { timeout: 15000 });
-
-        started = true;
-        console.log('⚡ Генерация официально пошла!');
-      } catch (e) {
-        console.log('⚠️ Статус генерации не засечен за 15 сек, но продолжаем контроль...');
-      }
-
-      // 4. ЖДЕМ ФИНИША (с динамическим отслеживанием пейволла)
-      if (started) {
-        console.log('⏳ Ждем полного завершения всех шагов v0...');
-        try {
-          await page.waitForFunction(() => {
-            const text = document.body.innerText;
-            const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="Cancel"]');
-
-            const isPaywallPresent = text.includes("Out of Credit") ||
-                                     text.includes("out of credits") ||
-                                     text.includes("Upgrade Plan") ||
-                                     text.includes("Activate v0 Plus");
-
-            const isStillWorking = text.includes("Generating") ||
-                                   text.includes("Thinking") ||
-                                   text.includes("Installing") ||
-                                   text.includes("Executing") ||
-                                   text.includes("Building");
-
-            return isPaywallPresent || (!stopBtn && !isStillWorking);
-          }, { timeout: 240000 });
-
-          const hitPaywallDuringGen = await checkIsPaywall(page);
-
-          if (hitPaywallDuringGen) {
-            console.log(`❌ Генерация прервана: у аккаунта #${currentTokenIndex + 1} закончились кредиты! Переносим сессию...`);
-            const migrated = await migrateSessionToNextToken();
-            if (!migrated) break;
-            continue;
-          }
-
-          console.log('✨ Код сгенерирован! Ждем 4 сек на финализацию файлового дерева...');
-          await page.waitForTimeout(4000);
-          console.log('🎯 Генерация 100% окончена!');
-        } catch (e) {
-          throw new Error("Таймаут: генерация заняла больше 4 минут.");
-        }
-      } else {
-        console.log('⏳ Ожидаем 25 секунд на случай быстрой генерации...');
-        await page.waitForTimeout(25000);
-      }
-
-      // 5. ПЕРЕКЛЮЧАЕМСЯ НА ТАБ CODE И СОБИРАЕМ ФАЙЛЫ
-      try {
-        const codeTab = page.locator('button:has-text("Code"), [role="tab"]:has-text("Code")').first();
-        if (await codeTab.isVisible()) {
-          await codeTab.click();
-          await page.waitForTimeout(800);
-        }
-      } catch (e) {}
-
-      console.log('📦 Сборка файлов проекта...');
-      const filesData = await page.evaluate(async () => {
-        const resultFiles = [];
-        const fileElements = Array.from(document.querySelectorAll('[data-filename], button[class*="file"], div[class*="file-item"]'));
-
-        if (fileElements.length > 0) {
-          for (const el of fileElements) {
-            const filePath = el.getAttribute('data-filename') || el.innerText.trim();
-            if (!filePath || !filePath.includes('.')) continue;
-
-            el.click();
-            await new Promise(r => setTimeout(r, 400));
-            const codeElement = document.querySelector('.monaco-editor, pre, code');
-            if (codeElement) {
-              resultFiles.push({ relativePath: filePath, content: codeElement.innerText });
-            }
-          }
-        }
-
-        if (resultFiles.length === 0) {
-          const codeElement = document.querySelector('.monaco-editor, pre, code');
-          if (codeElement) {
-            resultFiles.push({ relativePath: 'components/generated-component.tsx', content: codeElement.innerText });
-          }
-        }
-
-        return resultFiles;
-      });
-
-      // Сохраняем файлы в папку output
-      const savedFilesInfo = [];
-      for (const file of filesData) {
-        const fullPath = path.join(outputDir, file.relativePath);
-        const dirName = path.dirname(fullPath);
-
-        if (!fs.existsSync(dirName)) {
-          fs.mkdirSync(dirName, { recursive: true });
-        }
-        fs.writeFileSync(fullPath, file.content, 'utf-8');
-        savedFilesInfo.push(file.relativePath);
-        console.log(`  └─ Сохранен: output/${file.relativePath}`);
-      }
-
-      return res.json({
-        success: true,
-        chatUrl: page.url(),
-        modelUsed: model,
-        accountUsed: currentTokenIndex + 1,
-        filesSaved: savedFilesInfo,
-        stats: {
-          totalAccounts: tokensPool.length,
-          exhaustedAccountsCount: exhaustedTokens.size,
-          activeAccountsRemaining: tokensPool.length - exhaustedTokens.size
-        }
-      });
-    }
-
-    res.status(429).json({ error: 'Все аккаунты исчерпали лимит' });
+    const result = await runGeneration({ prompt, model });
+    return res.json(result);
 
   } catch (error) {
     console.error('❌ Ошибка:', error.message);
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
+
 
 app.listen(3000, async () => {
   console.log('🚀 API запущен на http://localhost:3000');
