@@ -29,6 +29,7 @@ for (const dir of [promptsDir, promptsDoneDir]) {
 }
 
 const TOKENS_FILE = path.join(process.cwd(), 'tokens.txt');
+const USED_TOKENS_FILE = path.join(process.cwd(), 'used_tokens.txt');
 
 function loadTokens() {
   if (!fs.existsSync(TOKENS_FILE)) {
@@ -40,14 +41,69 @@ function loadTokens() {
     .split(/[\r\n]+/)
     .flatMap(line => line.split(/\s+/))
     .map(t => t.replace(/['";]/g, '').trim())
-    .filter(t => t.length > 20);
+    .filter(t => t.length > 20)
+    .filter(t => !t.startsWith('U')); // на всякий случай: помеченные не подхватываем
 }
 
-const tokensPool = loadTokens();
+// Токены перечитываем с диска при каждом обращении — файлы правит и сервер, и пользователь
+let tokensPool = loadTokens();
 const exhaustedTokens = new Set();
 let currentTokenIndex = 0;
 
 console.log(`🔑 Загружено токенов: ${tokensPool.length}`);
+
+// Переносит токен из tokens.txt в used_tokens.txt с префиксом U и перезагружает пул
+function markTokenUsedInFile(token) {
+  try {
+    const lines = fs.existsSync(TOKENS_FILE)
+      ? fs.readFileSync(TOKENS_FILE, 'utf-8').split(/\r?\n/)
+      : [];
+
+    const kept = [];
+    let removed = false;
+    for (const line of lines) {
+      if (!removed && line.includes(token)) {
+        removed = true; // вырезаем строку с токеном целиком
+        continue;
+      }
+      kept.push(line);
+    }
+
+    // Убираем пустые хвостовые строки
+    while (kept.length && kept[kept.length - 1].trim() === '') kept.pop();
+    fs.writeFileSync(TOKENS_FILE, kept.join('\n') + (kept.length ? '\n' : ''), 'utf-8');
+
+    // В файл использованных — с префиксом U и меткой времени
+    if (removed) {
+      const stamp = new Date().toISOString();
+      fs.appendFileSync(USED_TOKENS_FILE, `U${token}  # used at ${stamp}\n`, 'utf-8');
+      console.log(`🗃️ Токен перенесен: tokens.txt → used_tokens.txt (помечен U)`);
+    }
+  } catch (e) {
+    console.error(`⚠️ Не удалось обновить файлы токенов: ${e.message}`);
+  }
+
+  tokensPool = loadTokens();
+  exhaustedTokens.add(token);
+
+  // Индекс не должен указывать за пределы нового пула
+  if (tokensPool.length === 0) {
+    currentTokenIndex = 0;
+  } else {
+    currentTokenIndex = currentTokenIndex % tokensPool.length;
+  }
+}
+
+// Пул мог обновиться снаружи (докинули токены в tokens.txt) — перечитываем
+function refreshTokensPool() {
+  const fresh = loadTokens();
+  if (fresh.length !== tokensPool.length || fresh.some(t => !tokensPool.includes(t))) {
+    tokensPool = fresh;
+    // Выкинуть из exhausted то, чего больше нет в файле used (пользователь вернул токен вручную)
+    if (tokensPool.length > 0) currentTokenIndex = currentTokenIndex % tokensPool.length;
+    console.log(`🔑 Пул токенов обновлен с диска: ${tokensPool.length} шт.`);
+  }
+}
 
 let browser;
 let context;
@@ -250,22 +306,30 @@ async function migrateSessionToNextToken() {
 }
 
 async function switchToNextToken() {
-  exhaustedTokens.add(tokensPool[currentTokenIndex]);
-  console.log(`⚠️ Аккаунт #${currentTokenIndex + 1} исчерпал лимит кредитов.`);
+  if (tokensPool.length === 0) {
+    console.error('🚨 Пул токенов пуст! Докиньте токенов в tokens.txt');
+    return false;
+  }
 
-  let attempts = 0;
-  while (attempts < tokensPool.length) {
-    currentTokenIndex = (currentTokenIndex + 1) % tokensPool.length;
-    attempts++;
+  const idx = currentTokenIndex % tokensPool.length;
+  const usedToken = tokensPool[idx];
+  console.log(`⚠️ Аккаунт #${idx + 1} исчерпал лимит кредитов.`);
 
-    if (!exhaustedTokens.has(tokensPool[currentTokenIndex])) {
-      console.log(`🔄 Переключились на аккаунт #${currentTokenIndex + 1}`);
-      await setSessionCookie(tokensPool[currentTokenIndex]);
+  // Сразу переносим в used_tokens.txt с префиксом U и перечитываем пул
+  markTokenUsedInFile(usedToken);
+
+  // Сканируем свежий пул с начала: старые позиции сдвинулись после вырезания строки
+  for (let i = 0; i < tokensPool.length; i++) {
+    const candidate = tokensPool[i];
+    if (!exhaustedTokens.has(candidate)) {
+      currentTokenIndex = i;
+      console.log(`🔄 Переключились на аккаунт #${i + 1} (свежих токенов в пуле: ${tokensPool.length - exhaustedTokens.size})`);
+      await setSessionCookie(candidate);
       return true;
     }
   }
 
-  console.error('🚨 Все аккаунты исчерпали свой баланс!');
+  console.error('🚨 Все аккаунты исчерпали свой баланс! Докиньте токенов в tokens.txt');
   return false;
 }
 
@@ -453,7 +517,9 @@ function parsePromptFile(rawText, fallbackModel) {
 async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputSubDir = null }) {
   const saveDir = outputSubDir ? path.join(outputDir, outputSubDir) : outputDir;
 
-  if (exhaustedTokens.size === tokensPool.length && tokensPool.length > 0) {
+  refreshTokensPool();
+
+  if (tokensPool.length === 0 || exhaustedTokens.size >= tokensPool.length) {
     const err = new Error('Все аккаунты исчерпали баланс');
     err.statusCode = 429;
     throw err;
@@ -462,10 +528,11 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
   await ensurePageAlive();
 
   let attempts = 0;
+  currentTokenIndex = currentTokenIndex % tokensPool.length;
 
   while (attempts < tokensPool.length) {
     attempts++;
-    console.log(`\n🚀 Запуск генерации (Аккаунт #${currentTokenIndex + 1})...`);
+    console.log(`\n🚀 Запуск генерации (Аккаунт #${(currentTokenIndex % tokensPool.length) + 1})...`);
     console.log(`📝 Промпт: "${prompt.slice(0, 120)}${prompt.length > 120 ? '…' : ''}"`);
 
     const currentUrl = page.url();
@@ -490,7 +557,7 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
     let isPaywall = await checkIsPaywall(page);
 
     if (isPaywall) {
-      console.log(`❌ На аккаунте #${currentTokenIndex + 1} закончились токены (Out of Credit)! Переносим сессию...`);
+      console.log(`❌ На аккаунте #${(currentTokenIndex % tokensPool.length) + 1} закончились токены (Out of Credit)! Переносим сессию...`);
       const migrated = await migrateSessionToNextToken();
       if (!migrated) break;
       continue;
@@ -544,7 +611,7 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
         const hitPaywallDuringGen = await checkIsPaywall(page);
 
         if (hitPaywallDuringGen) {
-          console.log(`❌ Генерация прервана: у аккаунта #${currentTokenIndex + 1} закончились кредиты! Переносим сессию...`);
+          console.log(`❌ Генерация прервана: у аккаунта #${(currentTokenIndex % tokensPool.length) + 1} закончились кредиты! Переносим сессию...`);
           const migrated = await migrateSessionToNextToken();
           if (!migrated) break;
           continue;
@@ -618,7 +685,7 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
       success: true,
       chatUrl: page.url(),
       modelUsed: model,
-      accountUsed: currentTokenIndex + 1,
+      accountUsed: (currentTokenIndex % tokensPool.length) + 1,
       filesSaved: savedFilesInfo,
       stats: {
         totalAccounts: tokensPool.length,
