@@ -532,7 +532,24 @@ async function checkIsPaywall(page) {
   });
 }
 
-// Автоответчик на уточняющие вопросы v0 ("Какой тип боя?" / "1 of 3" и т.д.),
+// Проверка: генерация ещё идёт? Дёргает page.evaluate с расширенным списком
+// ключевых слов под новый UI v0 ("Worked for Ns", "Working", "Created" и т.д.).
+async function isGenerationActive() {
+  return await page.evaluate(() => {
+    const text = (document.body && document.body.innerText) || '';
+    const has = (s) => text.toLowerCase().includes(s.toLowerCase());
+    const stopBtn = document.querySelector('button[aria-label*="Stop" i], button[aria-label*="Cancel" i]');
+    const stageWords = [
+      "Generating", "Thinking", "Installing", "Executing", "Building",
+      "Working", "Running", "Processing", "Analyzing", "Writing",
+      "Creating", "Updating", "Compiling", "Bundling"
+    ];
+    const isWorking = stageWords.some(w => has(w));
+    return !!stopBtn || isWorking;
+  }).catch(() => false);
+}
+
+
 // которые вылезают ПЕРЕД стартом генерации и блокируют всё.
 // Стратегия: на каждом шаге жмём первый вариант (radio), затем Next.
 // Если Next не активен или нет вариантов — жмём Skip. Повторяем, пока модалка
@@ -853,16 +870,7 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
     let started = false;
     const startDeadline = Date.now() + 30000;
     while (Date.now() < startDeadline) {
-      const detected = await page.evaluate(() => {
-        const text = document.body.innerText;
-        const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="Cancel"]');
-        const isWorking = text.includes("Generating") ||
-                          text.includes("Thinking") ||
-                          text.includes("Installing") ||
-                          text.includes("Executing") ||
-                          text.includes("Building");
-        return !!stopBtn || isWorking;
-      }).catch(() => false);
+      const detected = await isGenerationActive();
 
       if (detected) { started = true; break; }
 
@@ -881,6 +889,7 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
     if (started) {
       console.log('⏳ Ждем полного завершения всех шагов v0...');
       let finished = false;
+      let quietTicks = 0; // считаем подряд идущие "тихие" тики — финиш = 3 подряд
       const finishDeadline = Date.now() + 240000;
       while (Date.now() < finishDeadline) {
         // На каждом тике прогоняем автоответчик — v0 может подкинуть вопрос
@@ -888,21 +897,22 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
         await dismissClarifyingQuestions();
 
         const state = await page.evaluate(() => {
-          const text = document.body.innerText;
-          const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="Cancel"]');
+          const text = (document.body && document.body.innerText) || '';
           const isPaywallPresent = text.includes("Out of Credit") ||
                                    text.includes("out of credits") ||
                                    text.includes("Upgrade Plan") ||
                                    text.includes("Activate v0 Plus");
-          const isStillWorking = text.includes("Generating") ||
-                                 text.includes("Thinking") ||
-                                 text.includes("Installing") ||
-                                 text.includes("Executing") ||
-                                 text.includes("Building");
-          return { done: isPaywallPresent || (!stopBtn && !isStillWorking), paywall: isPaywallPresent };
-        }).catch(() => ({ done: false, paywall: false }));
+          return { paywall: isPaywallPresent };
+        }).catch(() => ({ paywall: false }));
+        state.active = await isGenerationActive();
 
-        if (state.done) { finished = true; break; }
+        if (state.paywall) { finished = true; break; }
+        if (state.active) {
+          quietTicks = 0;
+        } else {
+          quietTicks++;
+          if (quietTicks >= 3) { finished = true; break; } // 3 тика тишины = реально финиш
+        }
         await page.waitForTimeout(2500);
       }
 
@@ -930,40 +940,104 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
     // 5. ПЕРЕКЛЮЧАЕМСЯ НА ТАБ CODE И СОБИРАЕМ ФАЙЛЫ
     try {
       const codeTab = page.locator('button:has-text("Code"), [role="tab"]:has-text("Code")').first();
-      if (await codeTab.isVisible()) {
+      if (await codeTab.isVisible({ timeout: 3000 }).catch(() => false)) {
         await codeTab.click();
-        await page.waitForTimeout(800);
+        await page.waitForTimeout(1000);
       }
     } catch (e) {}
 
     console.log('📦 Сборка файлов проекта...');
-    const filesData = await page.evaluate(async () => {
-      const resultFiles = [];
-      const fileElements = Array.from(document.querySelectorAll('[data-filename], button[class*="file"], div[class*="file-item"]'));
 
-      if (fileElements.length > 0) {
-        for (const el of fileElements) {
-          const filePath = el.getAttribute('data-filename') || el.innerText.trim();
-          if (!filePath || !filePath.includes('.')) continue;
+    // Сначала пытаемся вытащить файлы через API-состояние чата v0 (если есть в window),
+    // это надёжнее парсинга DOM. Иначе — ручной обход дерева файлов.
+    let filesData = [];
 
-          el.click();
-          await new Promise(r => setTimeout(r, 400));
-          const codeElement = document.querySelector('.monaco-editor, pre, code');
-          if (codeElement) {
-            resultFiles.push({ relativePath: filePath, content: codeElement.innerText });
+    // Путь A: API/состояние проекта в глобальных объектах v0
+    try {
+      filesData = await page.evaluate(() => {
+        const out = [];
+        // v0 иногда кладёт состояние в __NEXT_DATA__ или в глобальный store
+        const nd = window.__NEXT_DATA__ && window.__NEXT_DATA__.props && window.__NEXT_DATA__.props.pageProps;
+        if (nd) {
+          const json = JSON.stringify(nd);
+          if (json.includes('"files"')) {
+            const walk = (obj) => {
+              if (!obj || typeof obj !== 'object') return;
+              if (Array.isArray(obj)) { for (const x of obj) walk(x); return; }
+              if (obj.path && obj.content && typeof obj.content === 'string') {
+                out.push({ relativePath: obj.path, content: obj.content });
+              }
+              for (const k of Object.keys(obj)) walk(obj[k]);
+            };
+            walk(nd);
           }
         }
-      }
+        return out;
+      }).catch(() => []);
+    } catch (e) {}
 
-      if (resultFiles.length === 0) {
-        const codeElement = document.querySelector('.monaco-editor, pre, code');
-        if (codeElement) {
-          resultFiles.push({ relativePath: 'components/generated-component.tsx', content: codeElement.innerText });
+    // Путь B: обход дерева файлов в DOM + чтение Monaco по клику
+    if (filesData.length === 0) {
+      const fileItems = await page.locator(
+        '[data-filename], [class*="file-item"], [class*="FileItem"], ' +
+        'button[class*="file"], [role="treeitem"], [class*="file-tree"] [class*="file"]'
+      ).elementHandles().catch(() => []);
+
+      console.log(`   найдено элементов дерева: ${fileItems.length}`);
+
+      for (const el of fileItems) {
+        const filePath = await el.getAttribute('data-filename').catch(() => null)
+          || (await el.innerText().catch(() => '')).trim();
+        if (!filePath || !filePath.includes('.') || filePath.length > 200) continue;
+
+        await el.click({ force: true }).catch(() => {});
+        await page.waitForTimeout(500);
+
+        // Чтение через Monaco-модель (точный контент без line-numbers), fallback на DOM
+        const content = await page.evaluate(() => {
+          // Monaco: пробуем получить текст из активной модели
+          try {
+            const editors = window.monaco && window.monaco.editor && window.monaco.editor.getEditors
+              ? window.monaco.editor.getEditors() : [];
+            if (editors && editors.length > 0) {
+              const m = editors[editors.length - 1].getModel();
+              if (m) return m.getValue();
+            }
+          } catch (_) {}
+          // Fallback: DOM, выкидываем номера строк
+          const ed = document.querySelector('.monaco-editor, pre, code');
+          if (ed) return ed.innerText.replace(/^\s*\d+\n/gm, '').replace(/^\s*\d+(?=\D)/gm, '');
+          return '';
+        }).catch(() => '');
+
+        if (content && content.trim().length > 0) {
+          filesData.push({ relativePath: filePath, content });
+          console.log(`  └─ ${filePath} (${content.length} симв.)`);
         }
       }
+    }
 
-      return resultFiles;
-    });
+    // Путь C: фолбэк — хоть один файл из активного редактора
+    if (filesData.length === 0) {
+      const content = await page.evaluate(() => {
+        try {
+          const editors = window.monaco && window.monaco.editor && window.monaco.editor.getEditors
+            ? window.monaco.editor.getEditors() : [];
+          if (editors && editors.length > 0) {
+            const m = editors[editors.length - 1].getModel();
+            if (m) return m.getValue();
+          }
+        } catch (_) {}
+        const ed = document.querySelector('.monaco-editor, pre, code');
+        return ed ? ed.innerText : '';
+      }).catch(() => '');
+      if (content && content.trim()) {
+        filesData.push({ relativePath: 'components/generated-component.tsx', content });
+        console.log('  └─ fallback: единственный файл из активного редактора');
+      }
+    }
+
+    console.log(`📦 Итого собрано файлов: ${filesData.length}`);
 
     // Сохраняем файлы в папку output (или output/<имя-задачи> для файлового режима)
     if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
