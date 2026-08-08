@@ -3,6 +3,7 @@ import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
 import { getTokenNumber, loadTokens, loadTokensWithNumbers, moveTokenToUsed, parseTokenLine } from './src/lib/token-store.js';
+import { V0ApiError, listChats, createChat, sendMessage, waitForCompletion, saveChatFiles, extractChatId } from './src/services/v0-api.js';
 
 // Фикс кодировки консоли Windows: иначе русские логи и промпты превращаются в "??????"
 if (process.platform === 'win32') {
@@ -222,6 +223,14 @@ function groupTokens(tokenEntries) {
 // переходим к следующему кандидату в памяти, не трогая файлы.
 // В used_tokens.txt токен попадает только при явном Out of Credit (markTokenUsedInFile).
 async function ensureAuthorized() {
+  // Шаг 0: живая сессия браузера (пользователь залогинен в Chrome через CDP) — куки не трогаем
+  await page.goto('https://v0.app', { timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  if (await isAuthorized()) {
+    console.log('✅ Живая сессия v0 активна — куки не требуются.');
+    return true;
+  }
+
   refreshTokensPool();
   if (tokensPool.length === 0) {
     throw Object.assign(new Error('Пул токенов пуст — добавьте валидные токены в tokens.txt'), { statusCode: 401 });
@@ -310,13 +319,20 @@ async function ensurePageAlive() {
       browser = await chromium.connectOverCDP('http://localhost:9333');
       console.log('🔗 Подключились к Chrome через CDP (порт 9333)');
     } catch (e) {
-      console.log('⚠️  Chrome на порту 9333 не найден, запускаю...');
-      console.log('   chrome.exe --remote-debugging-port=9333 --user-data-dir=%TEMP%\\chrome_link');
+      console.log(`⚠️ CDP недоступен (${String(e.message || e).split('\n')[0]}) — запускаю новый браузер.`);
+      console.log('   Подсказка: chrome.exe --remote-debugging-port=9333 --user-data-dir=%TEMP%\\chrome_link');
       browser = await chromium.launch({ headless: false });
     }
-    context = await browser.newContext({
-      permissions: ['clipboard-read', 'clipboard-write']
-    });
+    // Живая сессия: если Chrome уже открыт с профилем (CDP), используем его контекст с куками
+    const liveContexts = browser.contexts();
+    if (liveContexts.length > 0) {
+      context = liveContexts[0];
+      console.log('🔓 Использую существующую сессию браузера (куки профиля Chrome).');
+    } else {
+      context = await browser.newContext({
+        permissions: ['clipboard-read', 'clipboard-write']
+      });
+    }
     page = null;
   }
   if (!page || page.isClosed()) {
@@ -1113,9 +1129,154 @@ function parsePromptFile(rawText, fallbackModel) {
   return { prompt, model };
 }
 
+
+// ─────────────────────────────────────────────────────────────
+// 🚀 API-режим: генерация через официальное API v0 (api.v0.dev)
+// Использует ключи vcp_ из tokens.txt (Authorization: Bearer <ключ>)
+// Ключи: https://v0.app/settings/keys  (beta — вызовы тратят кредиты)
+// ─────────────────────────────────────────────────────────────
+let apiKeyIndex = 0;
+
+function getApiKeys() {
+  return loadTokensWithNumbers(TOKENS_FILE)
+    .filter(entry => detectTokenType(entry.token) === 'authorization')
+    .map(entry => decodeURIComponent(entry.token).replace(/^Bearer\s+/, '').trim())
+    .filter(t => t.length > 20);
+}
+
+// Одна генерация с ротацией ключей: создание чата или продолжение, ожидание, сохранение файлов
+async function apiGenerateOnce(apiKeys, { message, chatId = null, systemPrompt = null, saveDir = null }) {
+  const attempts = apiKeys.length;
+  let lastError = null;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    apiKeyIndex = apiKeyIndex % apiKeys.length;
+    const token = apiKeys[apiKeyIndex];
+    const accountNum = apiKeyIndex + 1;
+
+    if (exhaustedTokens.has(token)) {
+      apiKeyIndex++;
+      continue;
+    }
+
+    try {
+      let chat;
+      if (chatId) {
+        console.log(`📝 Продолжаю чат ${chatId} (аккаунт #${accountNum})...`);
+        await sendMessage(token, chatId, { message, systemPrompt });
+        chat = { id: chatId, webUrl: `https://v0.app/chat/${chatId}` };
+      } else {
+        console.log(`🚀 Создаю чат (аккаунт #${accountNum})...`);
+        chat = await createChat(token, { message, systemPrompt });
+        console.log(`   🔗 ${chat.webUrl || `https://v0.app/chat/${chat.id}`}`);
+      }
+
+      console.log('⏳ Жду генерацию (до 10 минут)...');
+      const assistant = await waitForCompletion(token, chat.id, {
+        onProgress: msgs => {
+          const last = msgs[msgs.length - 1];
+          const len = last && last.role === 'assistant' && last.content ? last.content.length : 0;
+          console.log(`   [${new Date().toISOString().slice(11, 19)}] ответ: ${len} симв.`);
+        },
+      });
+
+      let files = 0;
+      if (saveDir) {
+        const saved = await saveChatFiles(token, chat.id, saveDir);
+        files = saved.count;
+        console.log(`💾 Файлов сохранено: ${files} → ${saveDir}`);
+      }
+
+      return {
+        chatId: chat.id,
+        webUrl: chat.webUrl || `https://v0.app/chat/${chat.id}`,
+        accountUsed: accountNum,
+        assistant,
+        files,
+        saveDir,
+      };
+    } catch (e) {
+      lastError = e;
+      const creditIssue = e instanceof V0ApiError && (e.status === 402 || /credit|balance|quota|billing/i.test(e.message));
+      if (e instanceof V0ApiError && (e.retryable || creditIssue)) {
+        console.log(`⚠️ Аккаунт #${accountNum}: ${e.message} (${e.status}). Пробуем следующий...`);
+        if (creditIssue) exhaustedTokens.add(token);
+        apiKeyIndex++;
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastError || new V0ApiError('Все API-аккаунты недоступны');
+}
+
+// Единичная генерация через API (новый проект или продолжение)
+async function runApiGeneration({ prompt, model = 'Opus 5', jobName = null, outputSubDir = null, continueUrl = null }) {
+  const apiKeys = getApiKeys();
+  const chatId = continueUrl ? extractChatId(continueUrl) : null;
+  const saveDir = outputSubDir
+    ? path.join(outputDir, outputSubDir)
+    : path.join(outputDir, chatId ? `chat-${chatId}` : `chat-${Date.now().toString(36)}`);
+
+  console.log(`\n🤖 Модель: ${model}`);
+  console.log(`📝 Промпт: ${prompt.slice(0, 120)}${prompt.length > 120 ? '...' : ''}\n`);
+
+  const result = await apiGenerateOnce(apiKeys, { message: prompt, chatId, saveDir });
+
+  // Если v0 ответил текстом без файлов — сохраняем ответ как RESULT.md
+  if (result.files === 0) {
+    const dir = result.saveDir || saveDir;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'RESULT.md'), result.assistant.content || '', 'utf8');
+    console.log(`💾 Ответ сохранён: ${path.join(dir, 'RESULT.md')}`);
+  }
+
+  return {
+    accountUsed: result.accountUsed,
+    chatUrl: result.webUrl,
+    shareUrl: null,
+    files: result.files,
+    summary: String(result.assistant.content || '').slice(0, 500),
+  };
+}
+
+// Многопромптовая цепочка через API: все шаги в одном чате, триггеры по тексту ответа
+async function runApiMultiPrompt({ config, jobName }) {
+  const apiKeys = getApiKeys();
+  const saveDir = path.join(outputDir, jobName);
+  let chatId = config.continueUrl ? extractChatId(config.continueUrl) : null;
+
+  for (const step of config.prompts) {
+    console.log(`\n📋 Шаг ${step.num}/${config.prompts.length}: ${step.text.slice(0, 100)}...`);
+    let done = false;
+    for (let retry = 0; retry < 3 && !done; retry++) {
+      const result = await apiGenerateOnce(apiKeys, {
+        message: retry === 0 ? step.text : buildRetryPrompt(step.text, config.retryPrompt, config.trigger),
+        chatId,
+        saveDir,
+      });
+      chatId = result.chatId;
+      done = checkTriggerInResponse(result.assistant.content || '', config.trigger);
+      console.log(done
+        ? `✅ Шаг ${step.num} завершён (триггер найден).`
+        : `⚠️ Триггер «${config.trigger}» не найден — retry ${retry + 1}/3.`);
+    }
+    if (!done) {
+      console.log(`❌ Шаг ${step.num} не прошёл триггер после 3 попыток — цепочка остановлена.`);
+      break;
+    }
+  }
+  console.log(`\n✅ Цепочка завершена. Проект: ${saveDir}`);
+}
+
 // --- Основной сценарий генерации, общий для HTTP и файлового режима ---
 async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputSubDir = null, continueUrl = null }) {
   const saveDir = outputSubDir ? path.join(outputDir, outputSubDir) : outputDir;
+
+  // 🚀 API-режим: если в tokens.txt есть vcp_ ключи — генерируем через официальное API v0
+  if (getApiKeys().length > 0) {
+    return runApiGeneration({ prompt, model, jobName, outputSubDir, continueUrl });
+  }
 
   refreshTokensPool();
 
@@ -1476,6 +1637,7 @@ import {
   inputProjectUrl, 
   inputSinglePrompt,
   selectMultiPromptFile,
+  selectProject,
   confirmContinue,
   KNOWN_MODELS
 } from './src/ui/interactive-menu.js';
@@ -1546,7 +1708,32 @@ async function runSinglePromptMode() {
 
 // Режим 2: Продолжить существующий проект
 async function runContinueProjectMode() {
-  const projectUrl = await inputProjectUrl();
+  const apiKeys = getApiKeys();
+  let projectUrl = null;
+
+  if (apiKeys.length > 0) {
+    // API-режим: показываем последние проекты аккаунта для выбора
+    try {
+      const chats = await listChats(apiKeys[apiKeyIndex % apiKeys.length], { limit: 10 });
+      if (chats.length > 0) {
+        const picked = await selectProject(chats);
+        if (picked === '__url__') {
+          projectUrl = await inputProjectUrl();
+        } else {
+          projectUrl = `https://v0.app/chat/${picked}`;
+          console.log(`📂 Выбран проект: ${projectUrl}`);
+        }
+      } else {
+        projectUrl = await inputProjectUrl();
+      }
+    } catch (e) {
+      console.log(`⚠️ Не удалось получить список проектов (${e.message}) — введите URL.`);
+      projectUrl = await inputProjectUrl();
+    }
+  } else {
+    projectUrl = await inputProjectUrl();
+  }
+
   const model = await selectModel(KNOWN_MODELS);
   const prompt = await inputSinglePrompt();
 
@@ -1554,7 +1741,9 @@ async function runContinueProjectMode() {
   console.log(`📝 Промпт: ${prompt.slice(0, 100)}${prompt.length > 100 ? '...' : ''}\n`);
 
   try {
-    const importedUrl = await importProjectFromUrl(projectUrl);
+    const importedUrl = apiKeys.length > 0
+      ? projectUrl
+      : await importProjectFromUrl(projectUrl);
     
     const result = await runGeneration({ prompt, model, continueUrl: importedUrl });
     console.log('\n✅ Генерация завершена!');
@@ -1586,6 +1775,17 @@ async function runMultiPromptMode(shouldContinue) {
   console.log(`🤖 Модель: ${config.model}`);
   console.log(`🎯 Триггер завершения: ${config.trigger}`);
   console.log(`📝 Промптов в цепочке: ${config.prompts.length}\n`);
+
+  // 🚀 API-режим цепочки (официальное API, vcp_ ключи из tokens.txt)
+  if (getApiKeys().length > 0) {
+    try {
+      await runApiMultiPrompt({ config, jobName });
+      console.log('\n✅ Цепочка (API) завершена.');
+    } catch (error) {
+      console.error(`\n❌ Ошибка: ${error.message}`);
+    }
+    process.exit(0);
+  }
 
   let progress = loadProgress(jobName, promptsDir);
   let startStep = 0;

@@ -146,3 +146,23 @@ export async function confirmContinue(jobName, currentStep, totalSteps) {
 
   return response.continue;
 }
+
+
+// Выбор проекта из списка последних чатов (API-режим)
+export async function selectProject(chats) {
+  const choices = [
+    ...chats.map((c, i) => ({
+      title: `${i + 1}. ${(c.title || c.id || '').slice(0, 50)} (${c.id})`,
+      value: c.id,
+    })),
+    { title: '🔗 Ввести URL вручную', value: '__url__' },
+  ];
+  const response = await prompts({
+    type: 'select',
+    name: 'project',
+    message: '📂 Выберите проект:',
+    choices,
+    initial: 0,
+  });
+  return response?.project ?? '__url__';
+}
