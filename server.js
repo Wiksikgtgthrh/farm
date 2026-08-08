@@ -1672,7 +1672,13 @@ async function startInteractiveMode() {
   // Для всех остальных режимов отключаем файловый вотчер
   fileWatcherEnabled = false;
 
-  await ensurePageAlive();
+  // 🚀 API-режим: если в tokens.txt есть vcp_ ключи — браузер не нужен,
+  // генерация идёт через официальное API v0 (api.v0.dev)
+  if (getApiKeys().length > 0) {
+    console.log('🔑 Найдены API-ключи (vcp_) — генерация через официальное API без браузера.');
+  } else {
+    await ensurePageAlive();
+  }
 
   if (mode === 'single') {
     await runSinglePromptMode();
