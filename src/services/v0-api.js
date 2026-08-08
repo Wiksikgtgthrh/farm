@@ -66,6 +66,20 @@ export async function createChat(token, { message, systemPrompt } = {}) {
   return apiCall(token, '/chats', { method: 'POST', body, timeoutMs: 300000 });
 }
 
+// Асинхронное создание чата: возвращает id сразу, генерация идёт в фоне
+export async function createChatAsync(token, { message, systemPrompt } = {}) {
+  const body = { message };
+  if (systemPrompt) body.systemPrompt = systemPrompt;
+  return apiCall(token, '/chats/async', { method: 'POST', body, timeoutMs: 60000 });
+}
+
+// Асинхронное продолжение чата
+export async function sendMessageAsync(token, chatId, { message, systemPrompt } = {}) {
+  const body = { message };
+  if (systemPrompt) body.systemPrompt = systemPrompt;
+  return apiCall(token, `/chats/${chatId}/messages/async`, { method: 'POST', body, timeoutMs: 60000 });
+}
+
 // Продолжить существующий чат (выбор проекта)
 export async function sendMessage(token, chatId, { message, systemPrompt } = {}) {
   const body = { message };
@@ -130,6 +144,59 @@ export async function waitForCompletion(token, chatId, { timeoutMs = 600000, int
     await sleep(intervalMs);
   }
   throw new V0ApiError('Превышено время ожидания генерации (10 минут)', { type: 'timeout' });
+}
+
+// Живой режим: ждёт генерацию, а файлы пишет на диск ПО МЕРЕ ПОЯВЛЕНИЯ (как IDE).
+// Каждые intervalMs: опрашивает /files и /messages; новые файлы -> '+', обновления -> '~'.
+export async function waitForLiveGeneration(token, chatId, destDir, { timeoutMs = 600000, intervalMs = 5000, onFile } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  const saved = new Map(); // path -> content
+  let prevSig = null;
+  let stableTicks = 0;
+  let assistant = null;
+
+  fs.mkdirSync(destDir, { recursive: true });
+
+  const writeFiles = async () => {
+    let files = [];
+    try { files = await getChatFiles(token, chatId); } catch (_) { return; }
+    for (const f of files) {
+      const safePath = path.normalize(f.path).replace(/^(\.\.(\/|\\))+/, '');
+      const fullPath = path.join(destDir, safePath);
+      const content = f.encoding === 'base64' ? Buffer.from(f.content, 'base64') : f.content;
+      const prev = saved.get(f.path);
+      if (prev !== content) {
+        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+        fs.writeFileSync(fullPath, content, f.encoding === 'base64' ? undefined : 'utf8');
+        const marker = prev === undefined ? '+' : '~';
+        if (onFile) onFile({ marker, path: f.path, size: content.length });
+        saved.set(f.path, content);
+      }
+    }
+  };
+
+  while (Date.now() < deadline) {
+    await writeFiles();
+    const messages = await getMessages(token, chatId).catch(() => []);
+    const last = messages[messages.length - 1];
+    if (last && last.role === 'assistant' && last.content) {
+      const sig = `${last.updatedAt}|${last.content.length}`;
+      if (prevSig === sig) {
+        stableTicks++;
+        if (stableTicks >= 2) { assistant = last; break; }
+      } else {
+        prevSig = sig;
+        stableTicks = 0;
+      }
+    } else {
+      prevSig = null;
+      stableTicks = 0;
+    }
+    await sleep(intervalMs);
+  }
+  await writeFiles(); // финальная синхронизация
+  if (!assistant) throw new V0ApiError('Превышено время ожидания генерации (10 минут)', { type: 'timeout' });
+  return { assistant, files: [...saved.keys()], count: saved.size };
 }
 
 // Вытаскивает id чата из URL вида https://v0.app/chat/abc123 или просто id
