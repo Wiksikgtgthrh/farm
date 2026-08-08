@@ -47,7 +47,7 @@ async function apiCall(token, urlPath, { method = 'GET', body, timeoutMs = 90000
       });
     }
     if (e.code === 'ECONNABORTED') {
-      throw new V0ApiError('Таймаут запроса к api.v0.dev', { type: 'timeout', retryable: true });
+      throw new V0ApiError(`Таймаут запроса к api.v0.dev (${Math.round(timeoutMs / 1000)}с)`, { type: 'timeout', retryable: true });
     }
     throw new V0ApiError(`Сеть: ${e.message}`, { type: 'network', retryable: true });
   }
@@ -55,7 +55,7 @@ async function apiCall(token, urlPath, { method = 'GET', body, timeoutMs = 90000
 
 // Список последних чатов аккаунта (для выбора проекта)
 export async function listChats(token, { limit = 20 } = {}) {
-  const data = await apiCall(token, `/chats?limit=${limit}`);
+  const data = await apiCall(token, `/chats?limit=${limit}`, { timeoutMs: 30000 });
   return data.chats || [];
 }
 
@@ -63,25 +63,25 @@ export async function listChats(token, { limit = 20 } = {}) {
 export async function createChat(token, { message, systemPrompt } = {}) {
   const body = { message };
   if (systemPrompt) body.systemPrompt = systemPrompt;
-  return apiCall(token, '/chats', { method: 'POST', body });
+  return apiCall(token, '/chats', { method: 'POST', body, timeoutMs: 300000 });
 }
 
 // Продолжить существующий чат (выбор проекта)
 export async function sendMessage(token, chatId, { message, systemPrompt } = {}) {
   const body = { message };
   if (systemPrompt) body.systemPrompt = systemPrompt;
-  return apiCall(token, `/chats/${chatId}/messages`, { method: 'POST', body });
+  return apiCall(token, `/chats/${chatId}/messages`, { method: 'POST', body, timeoutMs: 300000 });
 }
 
 // Сообщения чата (для определения завершения генерации)
 export async function getMessages(token, chatId) {
-  const data = await apiCall(token, `/chats/${chatId}/messages`);
+  const data = await apiCall(token, `/chats/${chatId}/messages`, { timeoutMs: 60000 });
   return data.data || [];
 }
 
 // Файлы чата: [{ path, content, encoding: 'utf8' | 'base64' }] — вся файловая иерархия
 export async function getChatFiles(token, chatId) {
-  const data = await apiCall(token, `/chats/${chatId}/files`);
+  const data = await apiCall(token, `/chats/${chatId}/files`, { timeoutMs: 60000 });
   return data.files || [];
 }
 

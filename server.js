@@ -1146,7 +1146,8 @@ function getApiKeys() {
 
 // Одна генерация с ротацией ключей: создание чата или продолжение, ожидание, сохранение файлов
 async function apiGenerateOnce(apiKeys, { message, chatId = null, systemPrompt = null, saveDir = null }) {
-  const attempts = apiKeys.length;
+  // Минимум 2 попытки — таймауты бывают транзиентными (сеть/очередь v0)
+  const attempts = Math.max(apiKeys.length, 2);
   let lastError = null;
 
   for (let attempt = 0; attempt < attempts; attempt++) {
@@ -1202,6 +1203,7 @@ async function apiGenerateOnce(apiKeys, { message, chatId = null, systemPrompt =
         console.log(`⚠️ Аккаунт #${accountNum}: ${e.message} (${e.status}). Пробуем следующий...`);
         if (creditIssue) exhaustedTokens.add(token);
         apiKeyIndex++;
+        await new Promise(r => setTimeout(r, 2500));
         continue;
       }
       throw e;
@@ -1217,9 +1219,6 @@ async function runApiGeneration({ prompt, model = 'Opus 5', jobName = null, outp
   const saveDir = outputSubDir
     ? path.join(outputDir, outputSubDir)
     : path.join(outputDir, chatId ? `chat-${chatId}` : `chat-${Date.now().toString(36)}`);
-
-  console.log(`\n🤖 Модель: ${model}`);
-  console.log(`📝 Промпт: ${prompt.slice(0, 120)}${prompt.length > 120 ? '...' : ''}\n`);
 
   const result = await apiGenerateOnce(apiKeys, { message: prompt, chatId, saveDir });
 
