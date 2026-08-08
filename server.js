@@ -35,6 +35,7 @@ const USED_TOKENS_FILE = path.join(process.cwd(), 'used_tokens.txt');
 // Токены перечитываем с диска при каждом обращении — файлы правит и сервер, и пользователь
 let tokensPool = loadTokens(TOKENS_FILE);
 const exhaustedTokens = new Set();
+let currentTokenIndex = 0;  // ФИКС: было не объявлено -> ReferenceError в strict mode (ESM)
 
 console.log(`🔑 Загружено токенов: ${tokensPool.length}`);
 
@@ -266,6 +267,7 @@ async function ensureAuthorized() {
           const authValue = raw.startsWith('Bearer ') ? raw : `Bearer ${raw}`;
           toAdd.push(
             { name: 'authorization', value: authValue, domain: '.vercel.com', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' },
+            { name: 'authorization', value: authValue, domain: '.v0.app', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' },
           );
         } else {
           toAdd.push(
@@ -282,6 +284,11 @@ async function ensureAuthorized() {
 
       if (await isAuthorized()) {
         console.log(`✅ Аккаунт #${group.num} авторизован (${label}).`);
+        // ФИКС: синхронизируем currentTokenIndex с реально авторизованным токеном,
+        // чтобы при Out of Credit в used переносился именно он, а не первый в пуле.
+        const authzToken = group.authorization || group.user_session;
+        const poolIdx = tokensPool.indexOf(authzToken);
+        if (poolIdx >= 0) currentTokenIndex = poolIdx;
         authorized = true;
         break;
       }
@@ -577,6 +584,7 @@ async function switchToNextToken() {
         const authValue = raw.startsWith('Bearer ') ? raw : `Bearer ${raw}`;
         await context.addCookies([
           { name: 'authorization', value: authValue, domain: '.vercel.com', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' },
+          { name: 'authorization', value: authValue, domain: '.v0.app', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' },
         ]);
       } else {
         await context.addCookies([
@@ -592,11 +600,11 @@ async function switchToNextToken() {
       // При неудаче НЕ переносим в used_tokens.txt (это могла быть медленная
       // отрисовка), просто помечаем в памяти как пропущенный и ищем дальше.
       if (!(await isAuthorized())) {
-        console.log(`🔒 Аккаунт #${accountNumber} не прошёл авторизацию после 3 проверок — пропускаем (токен в файле оставляем).`);
+        console.log(`🔒 Аккаунт #${i + 1} не прошёл авторизацию после 3 проверок — пропускаем (токен в файле оставляем).`);
         exhaustedTokens.add(candidate);
         continue;
       }
-      console.log(`✅ Аккаунт #${accountNumber} авторизован.`);
+      console.log(`✅ Аккаунт #${i + 1} авторизован.`);
       return true;
     }
   }

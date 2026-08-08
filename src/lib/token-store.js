@@ -9,7 +9,10 @@ export function parseTokenLine(line) {
     return { num: Number.parseInt(numbered[1], 10), token: numbered[2].trim() };
   }
 
-  const token = line.trim().split(/\s+#/, 1)[0];
+  // ФИКС: старый формат used_tokens.txt ("U<token>  # used at ...") — срезаем префикс U,
+  // иначе токен не совпадает с записью в tokens.txt и не считается исчерпанным
+  const unmarked = line.trim().replace(/^U(?=[A-Za-z0-9])/, '');
+  const token = unmarked.split(/\s+#/, 1)[0];
   return token.length > 20 && !token.includes('#') ? { num: null, token } : null;
 }
 
