@@ -3,7 +3,7 @@ import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
 import { getTokenNumber, loadTokens, loadTokensWithNumbers, moveTokenToUsed, parseTokenLine } from './src/lib/token-store.js';
-import { V0ApiError, listChats, createChat, sendMessage, waitForCompletion, saveChatFiles, extractChatId } from './src/services/v0-api.js';
+import { V0ApiError, listChats, createChat, sendMessage, waitForCompletion, saveChatFiles, extractChatId, generateLive } from './src/services/v0-api.js';
 
 // Фикс кодировки консоли Windows: иначе русские логи и промпты превращаются в "??????"
 if (process.platform === 'win32') {
@@ -1161,36 +1161,32 @@ async function apiGenerateOnce(apiKeys, { message, chatId = null, systemPrompt =
     }
 
     try {
-      let chat;
-      if (chatId) {
-        console.log(`📝 Продолжаю чат ${chatId} (аккаунт #${accountNum})...`);
-        await sendMessage(token, chatId, { message, systemPrompt });
-        chat = { id: chatId, webUrl: `https://v0.app/chat/${chatId}` };
-      } else {
+      let chatIdResolved = chatId;
+      if (!chatIdResolved) {
         console.log(`🚀 Создаю чат (аккаунт #${accountNum})...`);
-        chat = await createChat(token, { message, systemPrompt });
-        console.log(`   🔗 ${chat.webUrl || `https://v0.app/chat/${chat.id}`}`);
+      } else {
+        console.log(`📝 Продолжаю чат ${chatIdResolved} (аккаунт #${accountNum})...`);
       }
+      console.log('\u23F3 Генерация идёт — файлы пишутся на диск по мере готовности (live)...');
 
-      console.log('⏳ Жду генерацию (до 10 минут)...');
-      const assistant = await waitForCompletion(token, chat.id, {
-        onProgress: msgs => {
-          const last = msgs[msgs.length - 1];
-          const len = last && last.role === 'assistant' && last.content ? last.content.length : 0;
-          console.log(`   [${new Date().toISOString().slice(11, 19)}] ответ: ${len} симв.`);
+      const live = await generateLive(token, {
+        message,
+        systemPrompt,
+        chatId: chatIdResolved,
+        saveDir,
+        onFile: ({ marker, path: fp, size }) => {
+          console.log(`   [${new Date().toISOString().slice(11, 19)}] ${marker} ${fp} (${size} симв.)`);
         },
       });
 
-      let files = 0;
-      if (saveDir) {
-        const saved = await saveChatFiles(token, chat.id, saveDir);
-        files = saved.count;
-        console.log(`💾 Файлов сохранено: ${files} → ${saveDir}`);
-      }
+      const assistant = live.assistant;
+      const files = live.count;
+      console.log(`🔗 Чат: ${live.webUrl}`);
+      if (saveDir) console.log(`💾 Файлов на диске: ${files} → ${saveDir}`);
 
       return {
-        chatId: chat.id,
-        webUrl: chat.webUrl || `https://v0.app/chat/${chat.id}`,
+        chatId: live.id,
+        webUrl: live.webUrl,
         accountUsed: accountNum,
         assistant,
         files,
