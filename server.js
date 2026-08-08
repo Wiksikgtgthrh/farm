@@ -2,6 +2,7 @@ import express from 'express';
 import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
+import { getTokenNumber, loadTokens, loadTokensWithNumbers, moveTokenToUsed, parseTokenLine } from './src/lib/token-store.js';
 
 // Фикс кодировки консоли Windows: иначе русские логи и промпты превращаются в "??????"
 if (process.platform === 'win32') {
@@ -31,103 +32,25 @@ for (const dir of [promptsDir, promptsDoneDir]) {
 const TOKENS_FILE = path.join(process.cwd(), 'tokens.txt');
 const USED_TOKENS_FILE = path.join(process.cwd(), 'used_tokens.txt');
 
-// Разбирает строку с токеном. Поддерживает форматы:
-//   1)eyJhbGci...            — нумерованный активный
-//   eyJhbGci...              — голый токен
-//   1)3)eyJhbGci... # used at 2026-... — отработанный из used_tokens.txt
-// JWT выцепляем по сигнатуре (eyJ... . ... . ...), игнорируя префиксы и комментарии.
-function parseTokenLine(line) {
-  if (!line) return null;
-  // Ищем JWT: три base64-сегмента через точку, начинающихся с eyJ
-  const jwtMatch = line.match(/(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/);
-  if (jwtMatch) {
-    // Исходный номер аккаунта: первый N) в строке
-    const numMatch = line.match(/^\s*(\d+)\)/);
-    return { num: numMatch ? parseInt(numMatch[1], 10) : null, token: jwtMatch[1] };
-  }
-  // Старый формат без явного JWT-вида, но длинный и без комментария
-  const m = line.trim().match(/^(\d+)\)\s*(\S+)/);
-  if (m && m[2].length > 20) return { num: parseInt(m[1], 10), token: m[2] };
-  const bare = line.trim();
-  if (bare.length > 20 && !bare.includes('#')) return { num: null, token: bare };
-  return null;
-}
-
-function loadTokens() {
-  if (!fs.existsSync(TOKENS_FILE)) {
-    console.error('❌ Файл tokens.txt не найден!');
-    return [];
-  }
-  const rawContent = fs.readFileSync(TOKENS_FILE, 'utf-8');
-  return rawContent
-    .split(/[\r\n]+/)
-    .map(line => parseTokenLine(line))
-    .filter(Boolean)
-    .map(x => x.token);
-}
-
-
-
 // Токены перечитываем с диска при каждом обращении — файлы правит и сервер, и пользователь
-let tokensPool = loadTokens();
+let tokensPool = loadTokens(TOKENS_FILE);
 const exhaustedTokens = new Set();
-let currentTokenIndex = 0;
 
 console.log(`🔑 Загружено токенов: ${tokensPool.length}`);
 
 // Переносит токен из tokens.txt в used_tokens.txt с префиксом U и перезагружает пул
 function markTokenUsedInFile(token) {
-  try {
-    const lines = fs.existsSync(TOKENS_FILE)
-      ? fs.readFileSync(TOKENS_FILE, 'utf-8').split(/\r?\n/)
-      : [];
+  const moved = moveTokenToUsed({ token, tokensFile: TOKENS_FILE, usedTokensFile: USED_TOKENS_FILE });
+  console.log(`🗃️ Токен перенесен: tokens.txt → used_tokens.txt (аккаунт #${moved.number ?? 'без номера'})`);
 
-    const kept = [];
-    let removed = false;
-    let originalNum = null;
-    for (const line of lines) {
-      const parsed = parseTokenLine(line);
-      if (!removed && parsed && parsed.token === token) {
-        removed = true; // вырезаем строку с токеном целиком
-        originalNum = parsed.num;
-        continue;
-      }
-      kept.push(line);
-    }
-
-    // Убираем пустые хвостовые строки
-    while (kept.length && kept[kept.length - 1].trim() === '') kept.pop();
-    fs.writeFileSync(TOKENS_FILE, kept.join('\n') + (kept.length ? '\n' : ''), 'utf-8');
-
-    // В файл использованных: порядковый номер исчерпания + исходный номер + токен
-    // Пример: "1)3)eyJhbGci..." — первым исчерпал аккаунт №3
-    if (removed) {
-      const stamp = new Date().toISOString();
-      const usageCount = fs.existsSync(USED_TOKENS_FILE)
-        ? fs.readFileSync(USED_TOKENS_FILE, 'utf-8').split(/\r?\n/).filter(l => l.trim()).length
-        : 0;
-      const prefix = originalNum != null ? `${usageCount + 1})${originalNum})` : `${usageCount + 1})`;
-      fs.appendFileSync(USED_TOKENS_FILE, `${prefix}${token}  # used at ${stamp}\n`, 'utf-8');
-      console.log(`🗃️ Токен перенесен: tokens.txt → used_tokens.txt (запись ${prefix}...)`);
-    }
-  } catch (e) {
-    console.error(`⚠️ Не удалось обновить файлы токенов: ${e.message}`);
-  }
-
-  tokensPool = loadTokens();
+  tokensPool = loadTokens(TOKENS_FILE);
   exhaustedTokens.add(token);
-
-  // Индекс не должен указывать за пределы нового пула
-  if (tokensPool.length === 0) {
-    currentTokenIndex = 0;
-  } else {
-    currentTokenIndex = currentTokenIndex % tokensPool.length;
-  }
+  return true;
 }
 
 // Пул мог обновиться снаружи (докинули токены в tokens.txt) — перечитываем
 function refreshTokensPool() {
-  const fresh = loadTokens();
+  const fresh = loadTokens(TOKENS_FILE);
 
   // Перестраиваем exhausted из used_tokens.txt: что реально лежит в отработанных,
   // то и считаем исчерпанным. Ручной возврат токена (вырезал из used_tokens.txt
@@ -159,6 +82,9 @@ function refreshTokensPool() {
 let browser;
 let context;
 let page;
+let integrationInstalledForSession = false;
+let integrationInstallStartedAt = 0;
+let questionStepState = { fingerprint: '', submittedAt: 0 };
 
 // --- Fallback-хранилище состояния чата из БД-запросов (Supabase и др.) ---
 // Если share-link перенос по какой-то причине не сработает, здесь остаётся
@@ -206,35 +132,87 @@ function attachDbSniffer(targetPage) {
   });
 }
 
-async function setSessionCookie(token) {
-  await context.clearCookies();
-  // domain с ведущей точкой покрывает v0.app и все поддомены (chat, app и т.д.)
-  // sameSite: 'Lax' + secure — стандартный профиль сессионной куки v0, иначе браузер режет куку
-  await context.addCookies([{
-    name: 'user_session',
-    value: token,
-    domain: '.v0.app',
-    path: '/',
-    httpOnly: true,
-    secure: true,
-    sameSite: 'Lax'
-  }]);
+function detectTokenType(token) {
+  const decoded = decodeURIComponent(token);
+  if (decoded.startsWith('Bearer ') || decoded.startsWith('vcp_') || token.startsWith('Bearer%20') || token.startsWith('Bearer+')) return 'authorization';
+  return 'user_session';
 }
 
 // Проверяет, что текущая страница реально авторизована под выставленным токеном.
 // Надёжный сигнал авторизации — наличие поля ввода промпта (textarea / contenteditable).
 // v0 при битом/expired токене редиректит на /login, где поля ввода нет.
 async function isAuthorized() {
-  const url = page.url();
-  if (url.includes('/login') || url.includes('/signin') || url.includes('/auth')) return false;
-  try {
-    // Ждём до 12 сек появления поля ввода — это ПОЛОЖИТЕЛЬНЫЙ сигнал.
-    // Если поле появилось — авторизованы. Если за 12 сек не появилось — неоднозначно.
-    await page.waitForSelector('textarea, [contenteditable="true"]', { timeout: 12000 });
-    return true;
-  } catch (_) {
-    return false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const url = page.url();
+    // Только явные страницы логина; /api/auth/callback — это OAuth редирект, не логин
+    if (url.includes('/login?') || url.includes('/signin?') || url.includes('vercel.com/login')) {
+      console.log(`  [isAuthorized] URL логина: ${url.substring(0, 80)}`);
+      return false;
+    }
+    if (!url.includes('v0.app')) {
+      console.log(`  [isAuthorized] не v0.app: ${url.substring(0, 80)}`);
+      return false;
+    }
+
+    // На странице НЕ должно быть кнопок входа/регистрации (гостевая страница)
+    const hasLoginButton = await page.locator('button:has-text("Sign Up"), button:has-text("Log In"), button:has-text("Get Started"), a:has-text("Sign Up"), a:has-text("Log In")')
+      .first().isVisible({ timeout: 2000 }).catch(() => false);
+    if (hasLoginButton) {
+      console.log('  [isAuthorized] видна кнопка логина (гостевая страница)');
+      return false;
+    }
+
+    // Должен быть либо чат (textarea/contenteditable + sidebar), либо project list
+    const hasPrompt = await page.locator('textarea, [contenteditable="true"]')
+      .first().isVisible({ timeout: 8000 }).catch(() => false);
+    const hasSidebar = await page.locator('nav, [role="navigation"], aside, [data-sidebar]')
+      .first().isVisible({ timeout: 3000 }).catch(() => false);
+    console.log(`  [isAuthorized] attempt=${attempt} url=v0.app hasPrompt=${hasPrompt} hasSidebar=${hasSidebar}`);
+    if (hasPrompt || hasSidebar) return true;
+
+    if (attempt < 2) {
+      console.log('  [isAuthorized] reload...');
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+      await page.waitForTimeout(2500);
+    }
   }
+  return false;
+}
+
+// Группирует токены по номеру из tokens.txt: [{num, user_session, authorization}]
+// Токены с одинаковым номером (1), 2)...) попадают в одну группу.
+// Токены без номера группируются по порядку следования.
+function groupTokens(tokenEntries) {
+  const groups = new Map();
+
+  for (const { num, token } of tokenEntries) {
+    const key = num !== null ? String(num) : `_anon_${groups.size}`;
+    if (!groups.has(key)) {
+      groups.set(key, { user_session: null, authorization: null });
+    }
+    const group = groups.get(key);
+    const type = detectTokenType(token);
+    if (type === 'user_session') {
+      group.user_session = token;
+    } else {
+      group.authorization = token;
+    }
+  }
+
+  // Сортируем: сначала с номерами по возрастанию, потом анонимные
+  const sorted = Array.from(groups.entries()).sort(([a], [b]) => {
+    const aNum = Number.parseInt(a, 10);
+    const bNum = Number.parseInt(b, 10);
+    if (!Number.isNaN(aNum) && !Number.isNaN(bNum)) return aNum - bNum;
+    if (!Number.isNaN(aNum)) return -1;
+    if (!Number.isNaN(bNum)) return 1;
+    return 0;
+  });
+
+  return sorted.map(([key, g]) => {
+    const n = Number.parseInt(key, 10);
+    return { num: Number.isNaN(n) ? null : n, ...g };
+  });
 }
 
 // Перебирает токены, пока не добьётся авторизованной страницы.
@@ -248,28 +226,69 @@ async function ensureAuthorized() {
     throw Object.assign(new Error('Пул токенов пуст — добавьте валидные токены в tokens.txt'), { statusCode: 401 });
   }
 
-  const tried = new Set();
-  for (let attempt = 0; attempt <= tokensPool.length; attempt++) {
-    if (tokensPool.length === 0) break;
-    const idx = currentTokenIndex % tokensPool.length;
-    const candidate = tokensPool[idx];
-    if (tried.has(candidate)) {
-      // Уже пробовали этот — двигаем индекс к следующему
-      currentTokenIndex = (currentTokenIndex + 1) % tokensPool.length;
-      continue;
+  const tokenEntries = loadTokensWithNumbers(TOKENS_FILE);
+  const groups = groupTokens(tokenEntries);
+  const triedGroups = new Set();
+
+  for (let gIdx = 0; gIdx < groups.length; gIdx++) {
+    const group = groups[gIdx];
+    const groupKey = `${group.num ?? 'anon'}_${gIdx}`;
+    if (triedGroups.has(groupKey)) continue;
+    triedGroups.add(groupKey);
+
+    const { user_session: us, authorization: auth } = group;
+
+    // Комбинации для проверки: [описание, массив кук для установки]
+    const combos = [];
+    if (us) combos.push(['user_session', [{ type: 'user_session', token: us }]]);
+    if (auth) {
+      if (us) combos.push(['user_session+authorization', [
+        { type: 'user_session', token: us },
+        { type: 'authorization', token: auth }
+      ]]);
+      combos.push(['authorization', [{ type: 'authorization', token: auth }]]);
     }
-    tried.add(candidate);
 
-    await setSessionCookie(candidate);
-    await page.goto('https://v0.app', { timeout: 20000 }).catch(() => {});
+    if (combos.length === 0) continue;
 
-    if (await isAuthorized()) {
-      console.log(`✅ Аккаунт #${idx + 1} авторизован.`);
-      return true;
+    let authorized = false;
+    for (const [label, cookies] of combos) {
+      // Очищаем и ставим все куки из комбинации
+      integrationInstalledForSession = false;
+      integrationInstallStartedAt = 0;
+      questionStepState = { fingerprint: '', submittedAt: 0 };
+      await context.clearCookies();
+
+      const toAdd = [];
+      for (const c of cookies) {
+        if (c.type === 'authorization') {
+          const raw = decodeURIComponent(c.token);
+          const authValue = raw.startsWith('Bearer ') ? raw : `Bearer ${raw}`;
+          toAdd.push(
+            { name: 'authorization', value: authValue, domain: '.vercel.com', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' },
+          );
+        } else {
+          toAdd.push(
+            { name: 'user_session', value: c.token, domain: '.v0.dev', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' },
+            { name: 'user_session', value: c.token, domain: '.v0.app', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' },
+          );
+        }
+      }
+      await context.addCookies(toAdd);
+      console.log(`  [ensureAuthorized] Пробую аккаунт #${group.num} (${label}), кук: ${toAdd.length}`);
+
+      await page.goto('https://v0.app', { timeout: 20000 }).catch(() => {});
+      await page.waitForTimeout(2000);
+
+      if (await isAuthorized()) {
+        console.log(`✅ Аккаунт #${group.num} авторизован (${label}).`);
+        authorized = true;
+        break;
+      }
     }
 
-    console.log(`🔒 Аккаунт #${idx + 1} не показал поле ввода — пропускаем (токен в файле оставляем).`);
-    currentTokenIndex = (currentTokenIndex + 1) % tokensPool.length;
+    if (authorized) return true;
+    console.log(`🔒 Аккаунт #${group.num} не прошёл авторизацию — пропускаем.`);
   }
 
   throw Object.assign(
@@ -280,20 +299,23 @@ async function ensureAuthorized() {
 
 async function ensurePageAlive() {
   if (!browser || !browser.isConnected()) {
-    browser = await chromium.launch({ headless: false });
+    try {
+      browser = await chromium.connectOverCDP('http://localhost:9333');
+      console.log('🔗 Подключились к Chrome через CDP (порт 9333)');
+    } catch (e) {
+      console.log('⚠️  Chrome на порту 9333 не найден, запускаю...');
+      console.log('   chrome.exe --remote-debugging-port=9333 --user-data-dir=%TEMP%\\chrome_link');
+      browser = await chromium.launch({ headless: false });
+    }
     context = await browser.newContext({
       permissions: ['clipboard-read', 'clipboard-write']
     });
     page = null;
   }
   if (!page || page.isClosed()) {
-    if (tokensPool.length > 0) {
-      await setSessionCookie(tokensPool[currentTokenIndex]);
-    }
     page = await context.newPage();
     attachDbSniffer(page);
-    await page.goto('https://v0.app');
-    // На старом/битом токене v0 выкинет на /login — перебираем токены до авторизованного
+    // ensureAuthorized сама ставит куку и перебирает токены
     await ensureAuthorized();
   }
 }
@@ -303,11 +325,25 @@ async function ensurePageAlive() {
 // На текущем аккаунте: открыть Share → выставить "Anyone on the web" → вернуть ссылку
 // Каждый шаг ограничен по времени и логируется, чтобы перенос не зависал молча
 async function enableSharingAndGetLink() {
+  // Paywall/настройки интеграции могут оставаться поверх чата и перехватывать
+  // клик по Share. Закрываем их до открытия Share-диалога.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const openDialog = page.locator('[role="dialog"][data-state="open"], [role="dialog"]').last();
+    if (!(await openDialog.isVisible({ timeout: 500 }).catch(() => false))) break;
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(300);
+    if (await openDialog.isVisible({ timeout: 200 }).catch(() => false)) {
+      const close = openDialog.locator('button[aria-label*="close" i], button[aria-label*="dismiss" i]').first();
+      await close.click({ force: true }).catch(() => {});
+      await page.waitForTimeout(300);
+    }
+  }
+
   // 1. Кнопка Share: прямая в шапке чата, либо внутри меню "..."
   console.log('🔍 Шаг 1/4: ищу кнопку Share...');
   let shareClicked = false;
 
-  const directShare = page.locator('button:has-text("Share")').first();
+  const directShare = page.locator('button[data-testid="share-block-button"], button[aria-label="Share"], button:has-text("Share")').first();
   if (await directShare.isVisible({ timeout: 3000 }).catch(() => false)) {
     await directShare.click();
     shareClicked = true;
@@ -403,12 +439,63 @@ async function duplicateChatFromLink(shareUrl) {
   console.log('🔍 Кнопка Duplicate найдена, кликаю...');
   await dupBtn.click();
 
+  // В актуальном v0 после первого клика может открыться мастер: выбрать
+  // аккаунт/проект (галочка), затем подтвердить Duplicate ещё раз.
+  await page.waitForTimeout(800);
+  const accountChoice = page.locator(
+    '[role="dialog"] input[type="radio"], [role="dialog"] input[type="checkbox"], ' +
+    '[role="dialog"] [role="radio"], [role="dialog"] [role="checkbox"]'
+  ).first();
+  if (await accountChoice.isVisible({ timeout: 2000 }).catch(() => false)) {
+    await accountChoice.click({ force: true });
+    console.log('🔍 Выбран аккаунт для дублирования.');
+    await page.waitForTimeout(500);
+  }
+
+  const confirmDuplicate = page.locator(
+    '[role="dialog"] button:has-text("Duplicate"), [role="dialog"] button:has-text("Continue"), [role="dialog"] button:has-text("Create")'
+  ).last();
+  if (await confirmDuplicate.isVisible({ timeout: 3000 }).catch(() => false)) {
+    const disabled = await confirmDuplicate.isDisabled().catch(() => true);
+    if (!disabled) {
+      await confirmDuplicate.click();
+      console.log('🔍 Дублирование подтверждено.');
+    }
+  }
+
   // Ждем редиректа в клонированный чат нового аккаунта
   await page.waitForURL(/\/(chat|r)\//, { timeout: 25000 }).catch(() => {});
   await page.waitForTimeout(2500);
 
   const newUrl = page.url();
   console.log(`📋 Чат продублирован в новый аккаунт: ${newUrl}`);
+  return newUrl;
+}
+
+// Импорт чужого проекта по share-ссылке в текущую сессию
+// Используется когда пользователь вводит continue_url или указывает в файле
+async function importProjectFromUrl(projectUrl) {
+  console.log(`\n🔗 Импортирую проект: ${projectUrl}`);
+  
+  // Если это уже наш чат (наш аккаунт), просто открываем
+  if (projectUrl.includes('/chat/') && !(projectUrl.includes('/share/') || projectUrl.includes('?share='))) {
+    console.log('📂 Это приватный чат, пробую открыть напрямую...');
+    await page.goto(projectUrl, { timeout: 20000 });
+    await page.waitForTimeout(3000);
+    
+    // Проверяем, не редиректнуло ли на логин или 404
+    const currentUrl = page.url();
+    if (currentUrl.includes('/login') || currentUrl.includes('/404') || !currentUrl.includes('/chat/')) {
+      throw new Error('Приватный чат недоступен. Используйте публичную share-ссылку');
+    }
+    
+    console.log('✅ Приватный чат успешно открыт');
+    return currentUrl;
+  }
+  
+  // Если это share-ссылка, дублируем на текущий аккаунт
+  const newUrl = await duplicateChatFromLink(projectUrl);
+  console.log('✅ Проект импортирован в текущую сессию');
   return newUrl;
 }
 
@@ -481,10 +568,23 @@ async function switchToNextToken() {
   for (let i = 0; i < tokensPool.length; i++) {
     const candidate = tokensPool[i];
     if (!exhaustedTokens.has(candidate)) {
-      currentTokenIndex = i;
-      console.log(`🔄 Переключились на аккаунт #${i + 1} (свежих токенов в пуле: ${tokensPool.length - exhaustedTokens.size})`);
-      await setSessionCookie(candidate);
-      // Обязательно перезагружаем страницу — иначе UI остаётся в старой сессии
+      console.log(`🔄 Переключаемся на аккаунт #${i + 1} (токенов в активном пуле: ${tokensPool.length})`);
+
+      await context.clearCookies();
+      const type = detectTokenType(candidate);
+      if (type === 'authorization') {
+        const raw = decodeURIComponent(candidate);
+        const authValue = raw.startsWith('Bearer ') ? raw : `Bearer ${raw}`;
+        await context.addCookies([
+          { name: 'authorization', value: authValue, domain: '.vercel.com', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' },
+        ]);
+      } else {
+        await context.addCookies([
+          { name: 'user_session', value: candidate, domain: '.v0.dev', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' },
+          { name: 'user_session', value: candidate, domain: '.v0.app', path: '/', httpOnly: true, secure: true, sameSite: 'Lax' }
+        ]);
+      }
+
       await page.goto('https://v0.app', { timeout: 20000 }).catch(() => {});
       await page.waitForTimeout(2000);
 
@@ -492,10 +592,11 @@ async function switchToNextToken() {
       // При неудаче НЕ переносим в used_tokens.txt (это могла быть медленная
       // отрисовка), просто помечаем в памяти как пропущенный и ищем дальше.
       if (!(await isAuthorized())) {
-        console.log(`🔒 Аккаунт #${i + 1} не показал поле ввода после переключения — пропускаем (токен в файле оставляем).`);
+        console.log(`🔒 Аккаунт #${accountNumber} не прошёл авторизацию после 3 проверок — пропускаем (токен в файле оставляем).`);
         exhaustedTokens.add(candidate);
         continue;
       }
+      console.log(`✅ Аккаунт #${accountNumber} авторизован.`);
       return true;
     }
   }
@@ -539,13 +640,34 @@ async function isGenerationActive() {
     const text = (document.body && document.body.innerText) || '';
     const has = (s) => text.toLowerCase().includes(s.toLowerCase());
     const stopBtn = document.querySelector('button[aria-label*="Stop" i], button[aria-label*="Cancel" i]');
+    // В новом UI v0 кнопка Stop иногда не имеет aria-label. Её SVG содержит
+    // квадрат с характерным path, как в кнопке, показанной во время генерации.
+    const stopIcon = Array.from(document.querySelectorAll('button svg path')).some(path =>
+      // У v0 круг и квадрат могут быть в одном длинном path. Ищем квадрат как
+      // фрагмент, а не сравниваем атрибут d целиком.
+      (path.getAttribute('d') || '').replace(/\s+/g, '').includes('M10.55.5H5.5V10.5H10.5V5.5Z')
+    );
+    // Карточки уточнений появляются отдельными этапами и на это время v0 может
+    // убрать Stop-иконку. Пока есть прогресс вопросника и Next/Submit, работа
+    // не завершена и автоответчик должен обработать следующий этап.
+    const questionFormActive = Array.from(document.querySelectorAll('#prompt-form, [role="dialog"]')).some(container => {
+      const rect = container.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+      const text = container.innerText || '';
+      const hasProgress = /\d+\s*(of|из|\/)\s*\d+/i.test(text);
+      const hasAction = Array.from(container.querySelectorAll('button')).some(button =>
+        /^(next|далее|continue|submit|отправить)$/i.test((button.innerText || '').trim())
+      );
+      const hasOptions = !!container.querySelector('div.flex.flex-col.gap-0\\.5 button[type="button"]');
+      return hasAction && (hasProgress || hasOptions);
+    });
     const stageWords = [
       "Generating", "Thinking", "Installing", "Executing", "Building",
       "Working", "Running", "Processing", "Analyzing", "Writing",
       "Creating", "Updating", "Compiling", "Bundling"
     ];
     const isWorking = stageWords.some(w => has(w));
-    return !!stopBtn || isWorking;
+    return !!stopBtn || stopIcon || questionFormActive || isWorking;
   }).catch(() => false);
 }
 
@@ -555,94 +677,260 @@ async function isGenerationActive() {
 // Если Next не активен или нет вариантов — жмём Skip. Повторяем, пока модалка
 // не исчезнет или не упрёмся в лимит шагов.
 async function dismissClarifyingQuestions() {
-  const MAX_ROUNDS = 10;
+  const MAX_ROUNDS = 100;
   for (let round = 0; round < MAX_ROUNDS; round++) {
-    // Кандидат — любой видимый блок с прогрессом "N of M" и Skip/Next.
-    // Не привязываемся к [role="dialog"] (на скриншоте role мог быть другим).
-    const dlg = await page.evaluate(() => {
-      const blocks = Array.from(document.querySelectorAll(
-        '[role="dialog"], [data-testid*="question"], [data-testid*="survey"], ' +
-        '[class*="modal"], [class*="Modal"], [class*="dialog"], [class*="Dialog"], ' +
-        '[class*="question"], [class*="Question"], [class*="onboard"], [class*="Onboard"]'
-      ));
-      for (const b of blocks) {
-        const rect = b.getBoundingClientRect();
-        if (rect.width < 100 || rect.height < 60) continue;
-        const txt = (b.innerText || '').toLowerCase();
-        const hasProgress = /\d\s*(of|из|\/)\s*\d/.test(txt) || txt.includes('step ');
-        const hasOptions = !!b.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]');
-        const btnTexts = Array.from(b.querySelectorAll('button')).map(x => (x.innerText || '').toLowerCase().trim());
-        const hasSkip = btnTexts.some(t => t === 'skip' || t === 'пропустить');
-        const hasNext = btnTexts.some(t => t === 'next' || t === 'далее' || t === 'continue');
-        if ((hasProgress || hasOptions) && (hasSkip || hasNext)) {
-          return { found: true, hasSkip };
-        }
+    const action = await page.evaluate(() => {
+      const visible = (element) => {
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 &&
+          style.visibility !== 'hidden' && style.display !== 'none' &&
+          style.opacity !== '0' && style.pointerEvents !== 'none';
+      };
+      const form = document.querySelector('#prompt-form');
+      if (!form || !visible(form)) return { found: false };
+
+      const isContinueButton = button => /^(next|далее|continue|submit|отправить)$/i.test((button.innerText || '').trim());
+      const actionButtons = Array.from(form.querySelectorAll('button')).filter(button => visible(button) && isContinueButton(button));
+      if (!actionButtons.length) return { found: false };
+
+      // Next до выбора ответа обычно disabled. Всё равно берём последнюю
+      // видимую кнопку текущего этапа и сначала выбираем вариант.
+      const next = actionButtons.at(-1);
+
+      let card = next;
+      while (card && card !== form) {
+        const hasHeading = !!card.querySelector?.('h2');
+        const choiceCount = Array.from(card.querySelectorAll?.('button[type="button"]') || []).filter(button => {
+          const text = (button.innerText || '').trim();
+          return text && !/^(skip|пропустить|next|далее|continue|submit|отправить|close questions|scroll to bottom)$/i.test(text);
+        }).length;
+        if (hasHeading && choiceCount) break;
+        card = card.parentElement;
       }
-      return { found: false };
+      if (!card || card === form) return { found: true, advanced: false };
+
+      const option = Array.from(card.querySelectorAll('button[type="button"]')).find(button => {
+        if (!visible(button) || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
+        const text = (button.innerText || '').trim();
+        return text && !/^(skip|пропустить|next|далее|continue|submit|отправить|close questions|scroll to bottom)$/i.test(text);
+      });
+      if (!option) return { found: true, advanced: false };
+
+      const title = (card.querySelector('h2')?.innerText || '').trim();
+      const choices = Array.from(card.querySelectorAll('button[type="button"]'))
+        .map(button => (button.innerText || '').trim())
+        .filter(text => text && !/^(skip|пропустить|next|далее|continue|submit|отправить)$/i.test(text));
+      return {
+        found: true,
+        ready: true,
+        fingerprint: `${title}\n${choices.join('\n')}`,
+        actionText: (next.innerText || '').trim()
+      };
     }).catch(() => ({ found: false }));
 
-    if (!dlg.found) return; // вопросов нет — выходим
-
-    const dlgText = (await dlg.innerText().catch(() => '')).toLowerCase();
-    const isQuestionnaire = dlgText.includes('of 3') ||
-                             dlgText.includes('of 2') ||
-                             dlgText.includes('of 4') ||
-                             dlgText.includes('step ') ||
-                             await dlg.locator('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]').count() > 0;
-    if (!isQuestionnaire) {
-      // Это другой диалог (Share, paywall и т.п.) — не трогаем, выходим
+    if (!action.found) {
+      questionStepState = { fingerprint: '', submittedAt: 0 };
       return;
     }
 
-    console.log(`💬 Раунд ${round + 1}: найден уточняющий вопрос v0.`);
-
-    // 1) Пытаемся Skip — он закрывает ВСЕ оставшиеся шаги разом и стартует
-    //    генерацию с дефолтами v0. Это надёжнее, чем подбор варианта.
-    const skipBtn = page.locator('button:has-text("Skip"), button:has-text("Пропустить")').first();
-    if (await skipBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
-      await skipBtn.click({ force: true, timeout: 3000 }).catch(() => {});
-      console.log('   ↳ Нажали Skip — пропускаем все вопросы.');
-      await page.waitForTimeout(1200);
+    if (!action.ready) {
+      console.log('⚠️ Next пока не активен, жду обновления формы.');
+      await page.waitForTimeout(1000);
       continue;
     }
 
-    // 2) Skip нет — отвечаем первым вариантом + Next.
-    const firstOption = page.locator('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]').first();
-    if (await firstOption.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await firstOption.click({ force: true }).catch(() => {});
-    } else {
-      // варианты могут быть кликабельными строками без input
-      const row = page.locator('[role="option"], label').first();
-      if (await row.isVisible({ timeout: 1500 }).catch(() => false)) {
-        await row.click({ force: true }).catch(() => {});
+    // Один и тот же этап остаётся в DOM во время переходной анимации. Не
+    // выбираем и не отправляем его повторно, пока React не отрисует новый.
+    if (questionStepState.fingerprint === action.fingerprint) {
+      if (Date.now() - questionStepState.submittedAt > 8000) {
+        console.log('⚠️ Вопрос не сменился за 8 сек, жду UI v0 без повторного клика.');
       }
+      await page.waitForTimeout(700);
+      continue;
     }
-    await page.waitForTimeout(500);
 
-    const nextBtn = page.locator('button:has-text("Next"), button:has-text("Далее"), button:has-text("Continue")').first();
-    let advanced = false;
-    if (await nextBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-      const disabled = await nextBtn.getAttribute('disabled');
-      const ariaDisabled = await nextBtn.getAttribute('aria-disabled');
-      if (disabled === null && ariaDisabled !== 'true') {
-        await nextBtn.click({ force: true }).catch(() => {});
-        advanced = true;
-        console.log('   ↳ Выбрали первый вариант, нажали Next.');
+    const clicked = await page.evaluate((fingerprint) => {
+      const form = document.querySelector('#prompt-form');
+      if (!form) return false;
+      const visible = element => {
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.opacity !== '0' && style.pointerEvents !== 'none';
+      };
+      const actionPattern = /^(next|далее|continue|submit|отправить)$/i;
+      const actions = Array.from(form.querySelectorAll('button')).filter(button =>
+        visible(button) && actionPattern.test((button.innerText || '').trim())
+      );
+      const next = actions.at(-1);
+      if (!next) return false;
+      let card = next;
+      while (card && card !== form) {
+        const title = (card.querySelector?.('h2')?.innerText || '').trim();
+        const choices = Array.from(card.querySelectorAll?.('button[type="button"]') || [])
+          .map(button => (button.innerText || '').trim())
+          .filter(text => text && !/^(skip|пропустить|next|далее|continue|submit|отправить)$/i.test(text));
+        if (`${title}\n${choices.join('\n')}` === fingerprint) break;
+        card = card.parentElement;
       }
+      if (!card || card === form) return false;
+      const choice = Array.from(card.querySelectorAll('button[type="button"]')).find(button => {
+        const text = (button.innerText || '').trim();
+        return visible(button) && !button.disabled && text && !/^(skip|пропустить|next|далее|continue|submit|отправить)$/i.test(text);
+      });
+      if (!choice) return false;
+      choice.click();
+      return true;
+    }, action.fingerprint).catch(() => false);
+
+    if (!clicked) {
+      await page.waitForTimeout(700);
+      continue;
     }
-    if (!advanced) {
-      // Next не активен/нет — закрываем крестиком, чтобы не зависнуть
-      const closeBtn = page.locator('button[aria-label*="close" i], button[aria-label*="Close"], [aria-label*="close" i], button:has-text("Cancel"), button:has-text("Отмена")').first();
-      if (await closeBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
-        await closeBtn.click({ force: true }).catch(() => {});
-        console.log('   ↳ Next недоступен — закрыли модалку.');
-      }
-      await page.waitForTimeout(800);
-      return;
+
+    const actionButton = page.locator('#prompt-form button').filter({
+      hasText: /^(Next|Далее|Continue|Submit|Отправить)$/i
+    }).last();
+    const actionHandle = await actionButton.elementHandle().catch(() => null);
+    const enabled = actionHandle
+      ? await page.waitForFunction(button =>
+          !button.disabled && button.getAttribute('aria-disabled') !== 'true',
+        actionHandle, { timeout: 3000 }).then(() => true).catch(() => false)
+      : false;
+    if (!enabled) {
+      console.log('⚠️ Вариант выбран, но кнопка продолжения не активировалась.');
+      await page.waitForTimeout(700);
+      continue;
     }
-    await page.waitForTimeout(900);
+
+    await actionButton.click({ force: true });
+    questionStepState = { fingerprint: action.fingerprint, submittedAt: Date.now() };
+    console.log(`💬 Раунд ${round + 1}: выбран верхний вариант, нажата ${action.actionText}.`);
+    await page.waitForTimeout(1400);
   }
-  console.log('⚠️ Достигнут лимит раундов автоответчика (10).');
+  console.log('⚠️ Достигнут защитный лимит автоответчика (100).');
+}
+
+async function getVisibleV0Status() {
+  return await page.evaluate(() => {
+    const text = (document.body && document.body.innerText) || '';
+    const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+    return lines
+      .filter(line => /error|failed|unable|try again|upgrade|credit|limit|sign in|install|next|continue|не удалось|ошибка|лимит/i.test(line))
+      .slice(-8)
+      .join(' | ');
+  }).catch(() => 'страница v0 была закрыта');
+}
+
+async function handleInstallPrompts() {
+  if (integrationInstalledForSession) return false;
+
+  // Если текущая сессия уже показывает Manage, повторно Install не нужен.
+  if (await page.locator('button:has-text("Manage")').first().isVisible({ timeout: 500 }).catch(() => false)) {
+    integrationInstalledForSession = true;
+    integrationInstallStartedAt = 0;
+    console.log('✅ Интеграция Neon установлена, кнопка Manage появилась.');
+    return false;
+  }
+
+  // Install уже нажат. Не блокируем runner ожиданием Manage и не кликаем
+  // повторно: проверим результат на следующем тике основного цикла.
+  if (integrationInstallStartedAt) {
+    if (Date.now() - integrationInstallStartedAt > 60000) {
+      console.log('⚠️ Neon устанавливается больше 60 сек, продолжаю следить без повторного Install.');
+      integrationInstalledForSession = true;
+    }
+    return false;
+  }
+
+  const installButtons = page.locator('button:has-text("Install")');
+  let installBtn = null;
+  for (let index = 0; index < await installButtons.count(); index++) {
+    const candidate = installButtons.nth(index);
+    if (!(await candidate.isVisible({ timeout: 300 }).catch(() => false))) continue;
+    const cardText = await candidate.locator('xpath=ancestor::div[.//button[contains(., "Manage")]][1]')
+      .innerText()
+      .catch(() => '');
+    if (!cardText) {
+      installBtn = candidate;
+      break;
+    }
+  }
+  if (!installBtn) return false;
+
+  console.log('🧩 Найдена интеграция с кнопкой Install. Запускаю установку...');
+  const clicked = await installBtn.click({ force: true, timeout: 5000 }).then(() => true).catch(() => false);
+  if (!clicked) return false;
+  integrationInstallStartedAt = Date.now();
+  console.log('⏳ Install нажат, Neon устанавливается в фоне.');
+  return true;
+}
+
+async function handleGeneratedSecrets() {
+  const result = await page.evaluate(() => {
+    const input = Array.from(document.querySelectorAll('input[placeholder="Enter a key"]')).find(item => {
+      const rect = item.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+    if (!input) return { found: false };
+
+    const card = input.closest('div.p-2\\.5') || input.parentElement?.parentElement?.parentElement?.parentElement;
+    const label = card?.querySelector('label');
+    const name = (label?.textContent || 'секрет').trim();
+    const buttons = Array.from(card?.querySelectorAll('button') || []);
+    const generate = buttons.find(button => (button.textContent || '').trim() === 'Generate');
+    if (input.value.trim()) return { found: true, ready: true, name };
+    if (!generate) return { found: true, ready: false, canGenerate: false, name };
+    generate.click();
+    return { found: true, ready: false, canGenerate: true, name };
+  }).catch(() => ({ found: false }));
+
+  if (!result.found) return false;
+  if (result.ready) {
+    await submitGeneratedSecret();
+    return true;
+  }
+  if (!result.canGenerate) return false;
+
+  console.log(`🔐 Найден ${result.name}. Генерирую секрет...`);
+  const generated = await page.waitForFunction(() => {
+    return Array.from(document.querySelectorAll('input[placeholder="Enter a key"]')).some(input => input.value.trim());
+  }, { timeout: 15000 }).then(() => true).catch(() => false);
+
+  console.log(generated
+    ? `✅ ${result.name} сгенерирован.`
+    : `⚠️ ${result.name} не заполнился за 15 сек.`);
+  if (generated) await submitGeneratedSecret();
+  return generated;
+}
+
+async function submitGeneratedSecret() {
+  const action = await page.evaluate(() => {
+    const input = Array.from(document.querySelectorAll('input[placeholder="Enter a key"]')).find(item => item.value.trim());
+    const section = input?.closest('div.p-2\\.5') || input?.parentElement?.parentElement?.parentElement?.parentElement;
+    if (!section) return '';
+
+    // Submit находится в общем контейнере мастера, часто правее карточки,
+    // поэтому поднимаемся до ближайшего родителя с Submit.
+    let container = section;
+    let buttons = [];
+    while (container && container !== document.body) {
+      buttons = Array.from(container.querySelectorAll('button'));
+      if (buttons.some(button => /^(submit|continue|save)$/i.test((button.textContent || '').trim()))) break;
+      container = container.parentElement;
+    }
+    const submit = buttons.find(button => /^(submit|continue|save)$/i.test((button.textContent || '').trim()));
+    const button = submit;
+    if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return '';
+    const text = (button.textContent || '').trim();
+    button.click();
+    return text;
+  }).catch(() => '');
+
+  if (action) {
+    console.log(`🔐 Better Auth: нажата кнопка ${action}.`);
+    await page.waitForTimeout(1500);
+  }
 }
 
 // Поиск и клик по меню выбора моделей
@@ -679,6 +967,26 @@ async function openModelMenu() {
 
 async function selectModelInUI(targetModelName) {
   try {
+    // Ищем текущую модель только в форме отправки. Глобальный поиск может взять
+    // название модели из сообщения, рекомендации или уже открытого меню.
+    const currentModel = await page.locator('#prompt-form button, form button').evaluateAll((buttons) => {
+      const models = ['v0 Mini', 'v0 Pro', 'v0 Max', 'v0 Max Fast', 'Fable 5', 'Opus 5', 'Opus 5 Fast', 'GPT-5.6 Sol', 'Kimi K3'];
+      for (const button of buttons) {
+        const text = (button.innerText || '').trim();
+        const found = models.find(model => text.includes(model));
+        if (found) return found;
+      }
+      return null;
+    }).catch(() => null);
+
+    if (currentModel === targetModelName) {
+      console.log(`🎯 Модель уже выбрана: ${targetModelName}`);
+      return true;
+    }
+    if (currentModel) {
+      console.log(`🔄 Текущая модель: ${currentModel}. Переключаю на: ${targetModelName}`);
+    }
+
     const opened = await openModelMenu();
     if (!opened) return false;
 
@@ -798,7 +1106,7 @@ function parsePromptFile(rawText, fallbackModel) {
 }
 
 // --- Основной сценарий генерации, общий для HTTP и файлового режима ---
-async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputSubDir = null }) {
+async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputSubDir = null, continueUrl = null }) {
   const saveDir = outputSubDir ? path.join(outputDir, outputSubDir) : outputDir;
 
   refreshTokensPool();
@@ -825,7 +1133,13 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
     console.log(`📝 Промпт: "${prompt.slice(0, 120)}${prompt.length > 120 ? '…' : ''}"`);
 
     const currentUrl = page.url();
-    if (!currentUrl.includes('/chat/') && !currentUrl.includes('/r/')) {
+    // Если передан continueUrl, открываем его только если мы не в нужном чате
+    if (continueUrl) {
+      if (!currentUrl.includes(continueUrl.split('/').pop())) {
+        await page.goto(continueUrl, { timeout: 20000 });
+        await page.waitForTimeout(2000);
+      }
+    } else if (!currentUrl.includes('/chat/') && !currentUrl.includes('/r/')) {
       await page.goto('https://v0.app');
     }
 
@@ -852,7 +1166,9 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
 
     // 1b. АВТООТВЕТЧИК на уточняющие вопросы v0 ("Какой тип боя? 1 of 3" и т.д.),
     //     которые блокируют старт генерации. Жмём первый вариант → Next, пока не закроются.
+    await handleInstallPrompts();
     await dismissClarifyingQuestions();
+    await handleGeneratedSecrets();
 
     // 2. МГНОВЕННАЯ ПРОВЕРКА НА ЛИМИТ КРЕДИТОВ
     let isPaywall = await checkIsPaywall(page);
@@ -868,33 +1184,41 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
     //    не стартовала (модалка уточняющих вопросов могла вылезти с задержкой)
     console.log('⏳ Ждем запуск генерации на сервере v0...');
     let started = false;
-    const startDeadline = Date.now() + 30000;
+    const startDeadline = Date.now() + 60000;
     while (Date.now() < startDeadline) {
+      if (!browser?.isConnected() || !page || page.isClosed()) {
+        throw new Error('Окно Chromium было закрыто до запуска генерации');
+      }
       const detected = await isGenerationActive();
 
       if (detected) { started = true; break; }
 
       // Не пошла — возможно, снова висит модалка вопросов. Прогоняем и ждём дальше.
+      await handleInstallPrompts();
       await dismissClarifyingQuestions();
+      await handleGeneratedSecrets();
       await page.waitForTimeout(2500);
     }
 
     if (started) {
       console.log('⚡ Генерация официально пошла!');
     } else {
-      console.log('⚠️ Статус генерации не засечен за 30 сек, но продолжаем контроль...');
+      const status = await getVisibleV0Status();
+      throw new Error(`v0 не запустил генерацию за 60 секунд.${status ? ` Видимое состояние: ${status}` : ''}`);
     }
 
     // 4. ЖДЕМ ФИНИША (с динамическим отслеживанием пейволла И модалок вопросов)
     if (started) {
       console.log('⏳ Ждем полного завершения всех шагов v0...');
       let finished = false;
-      let quietTicks = 0; // считаем подряд идущие "тихие" тики — финиш = 3 подряд
-      const finishDeadline = Date.now() + 240000;
+      let quietTicks = 0; // считаем подряд идущие "тихие" тики — финиш = 5 подряд
+      const finishDeadline = Date.now() + 600000;
       while (Date.now() < finishDeadline) {
         // На каждом тике прогоняем автоответчик — v0 может подкинуть вопрос
         // прямо посреди генерации, и она встанет, пока не ответим.
+        await handleInstallPrompts();
         await dismissClarifyingQuestions();
+        await handleGeneratedSecrets();
 
         const state = await page.evaluate(() => {
           const text = (document.body && document.body.innerText) || '';
@@ -911,13 +1235,13 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
           quietTicks = 0;
         } else {
           quietTicks++;
-          if (quietTicks >= 3) { finished = true; break; } // 3 тика тишины = реально финиш
+          if (quietTicks >= 5) { finished = true; break; } // 5 тиков тишины = реально финиш
         }
         await page.waitForTimeout(2500);
       }
 
       if (!finished) {
-        throw new Error("Таймаут: генерация заняла больше 4 минут.");
+        throw new Error("Таймаут: генерация заняла больше 10 минут.");
       }
 
         const hitPaywallDuringGen = await checkIsPaywall(page);
@@ -929,12 +1253,8 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
           continue;
         }
 
-        console.log('✨ Код сгенерирован! Ждем 4 сек на финализацию файлового дерева...');
+        console.log('✨ Код сгенерирован.');
         await page.waitForTimeout(4000);
-        console.log('🎯 Генерация 100% окончена!');
-    } else {
-      console.log('⏳ Ожидаем 25 секунд на случай быстрой генерации...');
-      await page.waitForTimeout(25000);
     }
 
     // 5. ПЕРЕКЛЮЧАЕМСЯ НА ТАБ CODE И СОБИРАЕМ ФАЙЛЫ
@@ -945,8 +1265,6 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
         await page.waitForTimeout(1000);
       }
     } catch (e) {}
-
-    console.log('📦 Сборка файлов проекта...');
 
     // Сначала пытаемся вытащить файлы через API-состояние чата v0 (если есть в window),
     // это надёжнее парсинга DOM. Иначе — ручной обход дерева файлов.
@@ -983,8 +1301,6 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
         'button[class*="file"], [role="treeitem"], [class*="file-tree"] [class*="file"]'
       ).elementHandles().catch(() => []);
 
-      console.log(`   найдено элементов дерева: ${fileItems.length}`);
-
       for (const el of fileItems) {
         const filePath = await el.getAttribute('data-filename').catch(() => null)
           || (await el.innerText().catch(() => '')).trim();
@@ -1012,7 +1328,6 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
 
         if (content && content.trim().length > 0) {
           filesData.push({ relativePath: filePath, content });
-          console.log(`  └─ ${filePath} (${content.length} симв.)`);
         }
       }
     }
@@ -1033,11 +1348,8 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
       }).catch(() => '');
       if (content && content.trim()) {
         filesData.push({ relativePath: 'components/generated-component.tsx', content });
-        console.log('  └─ fallback: единственный файл из активного редактора');
       }
     }
-
-    console.log(`📦 Итого собрано файлов: ${filesData.length}`);
 
     // Сохраняем файлы в папку output (или output/<имя-задачи> для файлового режима)
     if (!fs.existsSync(saveDir)) fs.mkdirSync(saveDir, { recursive: true });
@@ -1051,12 +1363,19 @@ async function runGeneration({ prompt, model = 'Opus 5', jobName = null, outputS
       }
       fs.writeFileSync(fullPath, file.content, 'utf-8');
       savedFilesInfo.push(file.relativePath);
-      console.log(`  └─ Сохранен: ${path.relative(process.cwd(), fullPath)}`);
+    }
+
+    let shareUrl = null;
+    try {
+      shareUrl = await enableSharingAndGetLink();
+    } catch (error) {
+      console.log(`⚠️ Не удалось получить Share-ссылку: ${error.message}`);
     }
 
     return {
       success: true,
       chatUrl: page.url(),
+      shareUrl,
       modelUsed: model,
       accountUsed: (currentTokenIndex % tokensPool.length) + 1,
       filesSaved: savedFilesInfo,
@@ -1142,7 +1461,263 @@ app.post('/api/generate', async (req, res) => {
 });
 
 
-app.listen(3000, async () => {
-  console.log('🚀 API запущен на http://localhost:3000');
+// --- Интерактивный режим ---
+import { 
+  showMainMenu, 
+  selectModel, 
+  inputProjectUrl, 
+  inputSinglePrompt,
+  selectMultiPromptFile,
+  confirmContinue,
+  KNOWN_MODELS
+} from './src/ui/interactive-menu.js';
+
+import {
+  parseMultiPromptFile,
+  loadProgress,
+  saveProgress,
+  checkTriggerInResponse,
+  buildRetryPrompt
+} from './src/services/multi-prompt.js';
+
+let interactiveMode = null;
+let fileWatcherEnabled = false;
+
+async function startInteractiveMode() {
+  console.log('\n╔════════════════════════════════════════╗');
+  console.log('║   v0 Runner — Интерактивный режим     ║');
+  console.log('╚════════════════════════════════════════╝\n');
+
+  const mode = await showMainMenu();
+  interactiveMode = mode;
+
+  if (mode === 'api') {
+    console.log('\n🔄 Запущен в режиме HTTP API + файловый вотчер');
+    console.log('📂 Кладите .txt файлы в prompts/ для автоматической обработки');
+    console.log('🌐 HTTP API доступен на http://localhost:3000\n');
+    fileWatcherEnabled = true;
+    return;
+  }
+
+  // Для всех остальных режимов отключаем файловый вотчер
+  fileWatcherEnabled = false;
+
   await ensurePageAlive();
+
+  if (mode === 'single') {
+    await runSinglePromptMode();
+  } else if (mode === 'continue') {
+    await runContinueProjectMode();
+  } else if (mode === 'multi-new') {
+    await runMultiPromptMode(false);
+  } else if (mode === 'multi-continue') {
+    await runMultiPromptMode(true);
+  }
+}
+
+// Режим 1: Одиночный промпт
+async function runSinglePromptMode() {
+  const model = await selectModel(KNOWN_MODELS);
+  const prompt = await inputSinglePrompt();
+
+  console.log(`\n🤖 Модель: ${model}`);
+  console.log(`📝 Промпт: ${prompt.slice(0, 100)}${prompt.length > 100 ? '...' : ''}\n`);
+
+  try {
+    const result = await runGeneration({ prompt, model });
+    console.log('\n✅ Генерация завершена!');
+    console.log(`👤 Аккаунт: #${result.accountUsed}`);
+    console.log(`🔗 Чат: ${result.chatUrl}`);
+    if (result.shareUrl) console.log(`🔗 Share: ${result.shareUrl}`);
+  } catch (error) {
+    console.error(`\n❌ Ошибка: ${error.message}`);
+  }
+
+  process.exit(0);
+}
+
+// Режим 2: Продолжить существующий проект
+async function runContinueProjectMode() {
+  const projectUrl = await inputProjectUrl();
+  const model = await selectModel(KNOWN_MODELS);
+  const prompt = await inputSinglePrompt();
+
+  console.log(`🤖 Модель: ${model}`);
+  console.log(`📝 Промпт: ${prompt.slice(0, 100)}${prompt.length > 100 ? '...' : ''}\n`);
+
+  try {
+    const importedUrl = await importProjectFromUrl(projectUrl);
+    
+    const result = await runGeneration({ prompt, model, continueUrl: importedUrl });
+    console.log('\n✅ Генерация завершена!');
+    console.log(`👤 Аккаунт: #${result.accountUsed}`);
+    console.log(`🔗 Чат: ${result.chatUrl}`);
+    if (result.shareUrl) console.log(`🔗 Share: ${result.shareUrl}`);
+  } catch (error) {
+    console.error(`\n❌ Ошибка: ${error.message}`);
+  }
+
+  process.exit(0);
+}
+
+// Режим 3 и 4: Многопромптовая цепочка
+async function runMultiPromptMode(shouldContinue) {
+  const fileName = await selectMultiPromptFile(promptsDir, fs, path);
+  const filePath = path.join(promptsDir, fileName);
+  const jobName = path.basename(fileName, '.txt').replace(/[<>:"/\\|?*]/g, '_');
+
+  const rawText = fs.readFileSync(filePath, 'utf-8');
+  const config = parseMultiPromptFile(rawText);
+
+  if (config.prompts.length === 0) {
+    console.log('\n❌ В файле не найдено пронумерованных промптов');
+    process.exit(1);
+  }
+
+  console.log(`\n📋 Задача: ${jobName}`);
+  console.log(`🤖 Модель: ${config.model}`);
+  console.log(`🎯 Триггер завершения: ${config.trigger}`);
+  console.log(`📝 Промптов в цепочке: ${config.prompts.length}\n`);
+
+  let progress = loadProgress(jobName, promptsDir);
+  let startStep = 0;
+  let currentProjectUrl = null;
+
+  if (shouldContinue && progress) {
+    const shouldCont = await confirmContinue(jobName, progress.currentStep, config.prompts.length);
+    if (shouldCont) {
+      startStep = progress.currentStep - 1;
+      if (progress.continueUrl) {
+        console.log(`🔗 Восстанавливаю проект: ${progress.continueUrl}\n`);
+        currentProjectUrl = await importProjectFromUrl(progress.continueUrl);
+      }
+    }
+  } else if (config.continueUrl) {
+    currentProjectUrl = await importProjectFromUrl(config.continueUrl);
+  }
+
+  const outputSubDir = path.join('multi', jobName);
+
+  for (let i = startStep; i < config.prompts.length; i++) {
+    const promptItem = config.prompts[i];
+    const stepNum = i + 1;
+
+    console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    console.log(`📌 Шаг ${stepNum}/${config.prompts.length}: ${promptItem.text.slice(0, 60)}...`);
+    console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+
+    let attempt = 0;
+    let success = false;
+    const maxRetries = 2;
+
+    while (!success && attempt <= maxRetries) {
+      attempt++;
+      
+      let currentPrompt = promptItem.text;
+      if (attempt > 1) {
+        console.log(`♻️  Попытка ${attempt}/${maxRetries + 1} (retry с автодополнением)\n`);
+        currentPrompt = buildRetryPrompt(promptItem.text, config.retryPrompt, config.trigger);
+      }
+
+      try {
+        const result = await runGeneration({ 
+          prompt: currentPrompt, 
+          model: config.model, 
+          jobName: `${jobName}_step${stepNum}`,
+          outputSubDir,
+          continueUrl: currentProjectUrl
+        });
+
+        // Обновляем currentProjectUrl для следующего шага
+        currentProjectUrl = result.chatUrl;
+
+        // Проверяем наличие триггера в последнем ответе v0
+        const lastResponse = await page.evaluate(() => {
+          const messages = Array.from(document.querySelectorAll('[data-message-role="assistant"]'));
+          if (messages.length === 0) return '';
+          return messages[messages.length - 1].innerText;
+        });
+
+        if (checkTriggerInResponse(lastResponse, config.trigger)) {
+          console.log(`✅ Триггер "${config.trigger}" найден! Шаг ${stepNum} завершён.`);
+          success = true;
+
+          // Сохраняем прогресс
+          saveProgress(jobName, promptsDir, {
+            jobName,
+            currentStep: stepNum + 1,
+            totalSteps: config.prompts.length,
+            continueUrl: result.chatUrl,
+            lastUpdate: new Date().toISOString()
+          });
+
+        } else {
+          console.log(`⚠️ Триггер "${config.trigger}" не найден в ответе.`);
+          if (attempt <= maxRetries) {
+            console.log(`♻️  Повторяю шаг с retry-промптом...`);
+          }
+        }
+
+      } catch (error) {
+        console.error(`❌ Ошибка на шаге ${stepNum}: ${error.message}`);
+        
+        if (error.message.includes('закончились') || error.message.includes('исчерпал')) {
+          console.log(`♻️  Кредиты исчерпаны, сохраняю прогресс для продолжения позже...`);
+          
+          saveProgress(jobName, promptsDir, {
+            jobName,
+            currentStep: stepNum,
+            totalSteps: config.prompts.length,
+            continueUrl: page.url(),
+            lastUpdate: new Date().toISOString(),
+            needsRetry: true
+          });
+
+          console.log(`\n💾 Прогресс сохранён. Запустите заново с режимом "Продолжить многопромптовую цепочку"`);
+          process.exit(1);
+        }
+
+        throw error;
+      }
+    }
+
+    if (!success) {
+      console.log(`\n❌ Не удалось выполнить шаг ${stepNum} за ${maxRetries + 1} попыток`);
+      process.exit(1);
+    }
+  }
+
+  console.log(`\n\n🎉 Цепочка "${jobName}" полностью завершена!`);
+  console.log(`📂 Файлы сохранены в: output/${outputSubDir}/`);
+  
+  // Удаляем файл прогресса
+  const progressFile = path.join(promptsDir, 'done', `${jobName}.progress.json`);
+  if (fs.existsSync(progressFile)) fs.unlinkSync(progressFile);
+  
+  // Архивируем исходный файл
+  const doneFile = path.join(promptsDoneDir, fileName);
+  fs.renameSync(filePath, doneFile);
+
+  process.exit(0);
+}
+
+// Файловый вотчер (работает только в режиме API)
+setInterval(() => {
+  if (fileWatcherEnabled) {
+    processPromptFiles().catch(e => console.error('❌ Вотчер упал:', e.message));
+  }
+}, 2000);
+
+app.listen(3000, async () => {
+  try {
+    await startInteractiveMode();
+  } catch (e) {
+    if (e.statusCode === 401) {
+      console.error(`\n❌ ${e.message}`);
+    } else {
+      console.error(`\n💥 КРИТИЧЕСКАЯ ОШИБКА: ${e.message}`);
+      console.error(e.stack);
+    }
+    console.log('\n🛑 Сервер продолжает работу. Обновите tokens.txt и перезапустите.');
+  }
 });
